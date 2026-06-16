@@ -566,25 +566,52 @@ class RLMContextEngine(ContextEngine):
         limit = args.get("limit", self.search_limit)
         sort = args.get("sort", "relevance")
 
-        # Step 1: FTS5 search to gather initial context
+        # Step 1: Load messages from session lineage (no pre-filtering)
+        # The context goes into a Python variable in the REPL sandbox.
+        # The model accesses it programmatically — no token limit applies.
         try:
             if scope == "current" and self._session_id:
                 lineage = _get_session_lineage(db, self._session_id)
-                results = _search_scoped(db, query, session_ids=lineage,
-                                         limit=limit, sort=sort)
             else:
-                results = db.search_messages(
-                    query=query, limit=limit,
-                    sort=sort if sort in ("newest", "oldest") else None,
-                )
+                lineage = []
+
+            if lineage:
+                # Load all messages from the lineage
+                placeholders = ",".join("?" for _ in lineage)
+                with db._lock:
+                    rows = db._conn.execute(
+                        f"SELECT session_id, role, content, timestamp "
+                        f"FROM messages "
+                        f"WHERE session_id IN ({placeholders}) AND active = 1 "
+                        f"ORDER BY id",
+                        lineage,
+                    ).fetchall()
+            else:
+                # scope=all — load everything
+                with db._lock:
+                    rows = db._conn.execute(
+                        "SELECT session_id, role, content, timestamp "
+                        "FROM messages WHERE active = 1 ORDER BY id"
+                    ).fetchall()
+
+            messages = []
+            for row in rows:
+                sid = row["session_id"] if hasattr(row, "keys") else row[0]
+                role = row["role"] if hasattr(row, "keys") else row[1]
+                content = row["content"] if hasattr(row, "keys") else row[2]
+                if content:
+                    content = db._decode_content(content)
+                    messages.append(f"[session:{sid} role:{role}] {content}")
+
+            results_count = len(messages)
         except Exception as exc:
-            return json.dumps({"error": f"Search failed: {exc}"})
+            return json.dumps({"error": f"Failed to load messages: {exc}"})
 
-        if not results:
-            return json.dumps({"answer": "No relevant messages found.", "results_count": 0})
+        if not messages:
+            return json.dumps({"answer": "No messages found.", "results_count": 0})
 
-        # Format as context string
-        context = "\n\n".join(_format_message(m) for m in results)
+        # Build context string — this goes into the REPL as a variable
+        context = "\n\n".join(messages)
 
         # Step 2: Run the RLM REPL — model writes code to process context
         from repl import run_rlm_repl
@@ -610,7 +637,7 @@ class RLMContextEngine(ContextEngine):
 
         return json.dumps({
             "answer": answer,
-            "results_count": len(results),
+            "results_count": results_count,
             "method": "repl",
         })
 
