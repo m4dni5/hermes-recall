@@ -129,18 +129,25 @@ session_A → compress → session_B → compress → session_C → compress →
 | Quality of old context | Summary (may lose details) | Original messages (exact) |
 | Agent must actively retrieve | No (summary injected) | No (hook auto-retrieves) |
 
-### rlm_search (delegated, async)
+### rlm_search (inline RLM pipeline)
 
-For the full RLM pipeline (chunk → sub-query per chunk → synthesize), a one-line change to Hermes core is needed to pass the parent agent reference to engine tool calls:
+The `rlm_search` tool runs the full RLM pipeline inline — no delegation, no subprocess, no agent spawning:
 
-```python
-# In agent/tool_executor.py, line ~1137, change:
-return agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages)
-# To:
-return agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages, parent_agent=agent)
+1. FTS5 search across session lineage
+2. Chunk results into groups of N messages
+3. Sub-query the cheap model on each chunk **in parallel** (ThreadPoolExecutor)
+4. Synthesize chunk findings into a coherent answer
+
+Parallel sub-queries with `gpt-4.1-nano` complete in ~3-5 seconds total, even for large result sets.
+
+```yaml
+# Optional tuning (defaults shown)
+context:
+  engine: "rlm"
+  rlm:
+    chunk_size: 5        # messages per chunk
+    max_workers: 4       # parallel sub-queries
 ```
-
-Without this change, `rlm_search` falls back to lightweight synchronous retrieval (same as the hook). With it, `rlm_search` delegates to a child agent that runs the full RLM pipeline asynchronously.
 
 ## Limitations
 

@@ -4,18 +4,17 @@ Three layers:
   1. compress() trims to tail (instant, no LLM)
   2. pre_llm_call hook auto-retrieves relevant context every turn
      (FTS5 → single sub-query via call_llm → inject — lightweight, sync)
-  3. rlm_search tool delegates to a child agent that runs the full RLM
-     pipeline (FTS5 → chunk → sub-query per chunk via cheap model →
-     synthesize — heavyweight, async)
+  3. rlm_search tool runs the full RLM pipeline inline
+     (FTS5 → chunk → parallel sub-queries via cheap model → synthesize)
 
-The child agent writes Python to process archived messages, using the
-auxiliary compression model (from auxiliary.compression.model in config.yaml)
-for sub-queries. This mirrors the original RLM architecture: a smart root
-model orchestrates, cheap sub-models do the heavy lifting.
+No delegation needed. The engine IS the sandbox — handle_tool_call is
+Python code that can call call_llm multiple times, chunk results, and
+run sub-queries in parallel via ThreadPoolExecutor.
 """
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,10 +28,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PROTECT_LAST_N = 20
 _DEFAULT_SEARCH_LIMIT = 50
-_DEFAULT_MAX_AGG_TOKENS = 4096
+_DEFAULT_CHUNK_SIZE = 5          # messages per chunk for sub-queries
+_DEFAULT_MAX_WORKERS = 4         # parallel sub-queries
+_DEFAULT_MAX_CHUNK_TOKENS = 1024 # max tokens per chunk sub-query
+_DEFAULT_MAX_AGG_TOKENS = 4096   # max tokens for final aggregation
 
-# Post-compression context note. Must be clear enough that the agent
-# understands the retrieval architecture and uses rlm_search proactively.
+# Post-compression context note.
 _CONTEXT_NOTE = """[CONTEXT ARCHIVED — RLM RETRIEVAL ACTIVE]
 
 Earlier conversation turns have been removed from your active context window
@@ -47,8 +48,7 @@ active:
    - scope="current" searches this conversation's history (default)
    - scope="all" searches across all conversations
    - sort="newest"/"oldest"/"relevance"
-   - Results are processed by a dedicated sub-agent that chunks and
-     synthesizes findings using a cheap model.
+   - Results are chunked and processed in parallel using a cheap model.
 
 IMPORTANT: If you need context that isn't in the auto-retrieved section
 below, call rlm_search. Don't guess or hallucinate — search the archive."""
@@ -134,21 +134,67 @@ def _search_scoped(
     return results
 
 
-def _build_context_text(results: List[Dict[str, Any]]) -> str:
-    """Format search results into context for the sub-query model."""
-    parts = []
-    for r in results:
-        role = r.get("role", "unknown")
-        content = r.get("content", "")
-        snippet = r.get("snippet", "")
-        sid = r.get("session_id", "?")
-        display = snippet or (content[:500] + "..." if len(content) > 500 else content)
-        parts.append(f"[session:{sid} role:{role}] {display}")
-    return "\n\n".join(parts)
+def _format_message(msg: Dict[str, Any]) -> str:
+    """Format a single message for inclusion in a sub-query prompt."""
+    role = msg.get("role", "unknown")
+    content = msg.get("content", "")
+    snippet = msg.get("snippet", "")
+    sid = msg.get("session_id", "?")
+    display = snippet or (content[:500] + "..." if len(content) > 500 else content)
+    return f"[session:{sid} role:{role}] {display}"
+
+
+def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
+    """Call the auxiliary compression model directly."""
+    from agent.auxiliary_client import call_llm
+
+    response = call_llm(
+        task="compression",
+        main_runtime={},  # let auxiliary_client resolve from config
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+    )
+    content = response.choices[0].message.content
+    return content.strip() if isinstance(content, str) else str(content or "")
+
+
+def _query_chunk(query: str, chunk_msgs: List[Dict[str, Any]], chunk_idx: int) -> str:
+    """Sub-query: ask the cheap model about one chunk of messages."""
+    formatted = "\n\n".join(_format_message(m) for m in chunk_msgs)
+
+    prompt = (
+        "You are analyzing a chunk of archived conversation messages. "
+        "Extract ALL information relevant to the question below. "
+        "If nothing relevant is found, say 'NO_RELEVANT_INFO'.\n\n"
+        f"Question: {query}\n\n"
+        f"Chunk ({chunk_idx}):\n{formatted}"
+    )
+
+    return _call_aux_model(prompt, max_tokens=_DEFAULT_MAX_CHUNK_TOKENS)
+
+
+def _synthesize_findings(query: str, findings: List[str]) -> str:
+    """Aggregate: ask the cheap model to combine chunk findings."""
+    findings_text = "\n\n---\n\n".join(
+        f"Chunk {i+1}:\n{f}" for i, f in enumerate(findings)
+    )
+
+    prompt = (
+        "You are synthesizing findings from multiple chunks of a conversation "
+        "archive. Below are the results of analyzing each chunk for a question. "
+        "Combine them into a single, coherent answer. "
+        "If multiple chunks found the same information, consolidate. "
+        "If contradictions exist, note them.\n\n"
+        f"Question: {query}\n\n"
+        f"Findings from {len(findings)} chunks:\n{findings_text}\n\n"
+        "Provide a clear, complete answer:"
+    )
+
+    return _call_aux_model(prompt, max_tokens=_DEFAULT_MAX_AGG_TOKENS)
 
 
 def _get_aux_model_info() -> Dict[str, str]:
-    """Read auxiliary.compression model config from config.yaml."""
+    """Read auxiliary.compression model config."""
     try:
         from hermes_cli.config import load_config
         cfg = load_config() or {}
@@ -162,41 +208,21 @@ def _get_aux_model_info() -> Dict[str, str]:
         return {"model": "", "provider": ""}
 
 
-def _synthesize(query: str, context: str, main_runtime: Dict[str, str]) -> Optional[str]:
-    """Sub-query: send context + question to cheap model for synthesis."""
-    from agent.auxiliary_client import call_llm
+# ===========================================================================
+# Retrieval pipelines
+# ===========================================================================
 
-    prompt = (
-        "You are analyzing search results from a conversation archive. "
-        "Below are the most relevant messages found for the user's question. "
-        "Synthesize a clear, concise answer. "
-        "If the results don't contain enough information, say so briefly.\n\n"
-        f"Question: {query}\n\n"
-        f"Relevant messages ({len(context):,} chars):\n{context}"
-    )
-
-    response = call_llm(
-        task="compression",
-        main_runtime=main_runtime,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=_DEFAULT_MAX_AGG_TOKENS,
-    )
-    content = response.choices[0].message.content
-    return content.strip() if isinstance(content, str) else str(content or "")
-
-
-def retrieve(
+def retrieve_lightweight(
     query: str,
     db,
     session_id: str,
-    main_runtime: Dict[str, str],
     scope: str = "current",
     limit: int = 50,
     sort: str = "relevance",
 ) -> Optional[str]:
-    """Lightweight retrieval: FTS5 search → single sub-query → answer.
+    """Lightweight retrieval: FTS5 → single sub-query → answer.
 
-    Used by the pre_llm_call hook. Returns synthesized answer or None.
+    Used by the pre_llm_call hook. One LLM call, ~1-3 seconds.
     """
     try:
         if scope == "current" and session_id:
@@ -215,13 +241,97 @@ def retrieve(
     if not results:
         return None
 
-    context_text = _build_context_text(results)
+    formatted = "\n\n".join(_format_message(m) for m in results)
 
     try:
-        return _synthesize(query, context_text, main_runtime)
+        return _call_aux_model(
+            f"Answer this question using the archived messages below.\n\n"
+            f"Question: {query}\n\nMessages:\n{formatted}",
+            max_tokens=_DEFAULT_MAX_AGG_TOKENS,
+        )
     except Exception as exc:
         logger.warning("RLM sub-query failed: %s", exc)
-        return context_text[:4000]
+        return formatted[:4000]
+
+
+def retrieve_full(
+    query: str,
+    db,
+    session_id: str,
+    scope: str = "current",
+    limit: int = 50,
+    sort: str = "relevance",
+    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+    max_workers: int = _DEFAULT_MAX_WORKERS,
+) -> Optional[str]:
+    """Full RLM pipeline: FTS5 → chunk → parallel sub-queries → synthesize.
+
+    Used by the rlm_search tool. Multiple LLM calls in parallel, ~3-5 seconds.
+    """
+    try:
+        if scope == "current" and session_id:
+            lineage = _get_session_lineage(db, session_id)
+            results = _search_scoped(db, query, session_ids=lineage,
+                                     limit=limit, sort=sort)
+        else:
+            results = db.search_messages(
+                query=query, limit=limit,
+                sort=sort if sort in ("newest", "oldest") else None,
+            )
+    except Exception as exc:
+        logger.warning("RLM search failed: %s", exc)
+        return None
+
+    if not results:
+        return None
+
+    # Small result set — single sub-query is fine
+    if len(results) <= chunk_size:
+        formatted = "\n\n".join(_format_message(m) for m in results)
+        try:
+            return _call_aux_model(
+                f"Answer this question using the archived messages below.\n\n"
+                f"Question: {query}\n\nMessages:\n{formatted}",
+                max_tokens=_DEFAULT_MAX_AGG_TOKENS,
+            )
+        except Exception as exc:
+            logger.warning("RLM sub-query failed: %s", exc)
+            return formatted[:4000]
+
+    # Large result set — chunk and process in parallel
+    chunks = [results[i:i + chunk_size] for i in range(0, len(results), chunk_size)]
+    logger.info("RLM: %d results → %d chunks, querying in parallel", len(results), len(chunks))
+
+    findings = [None] * len(chunks)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx = {
+            pool.submit(_query_chunk, query, chunk, i): i
+            for i, chunk in enumerate(chunks)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                findings[idx] = future.result()
+            except Exception as exc:
+                logger.warning("RLM chunk %d failed: %s", idx, exc)
+                findings[idx] = f"(chunk {idx} failed: {exc})"
+
+    # Filter out chunks with no relevant info
+    relevant = [f for f in findings if f and "NO_RELEVANT_INFO" not in f.upper().replace("_", "")]
+    if not relevant:
+        return "No relevant information found in the archived messages."
+
+    # Single chunk — no need to aggregate
+    if len(relevant) == 1:
+        return relevant[0]
+
+    # Multiple chunks — synthesize
+    try:
+        return _synthesize_findings(query, relevant)
+    except Exception as exc:
+        logger.warning("RLM synthesis failed: %s", exc)
+        return "\n\n---\n\n".join(relevant)
 
 
 # ===========================================================================
@@ -239,9 +349,13 @@ class RLMContextEngine(ContextEngine):
         self,
         protect_last_n: int = _DEFAULT_PROTECT_LAST_N,
         search_limit: int = _DEFAULT_SEARCH_LIMIT,
+        chunk_size: int = _DEFAULT_CHUNK_SIZE,
+        max_workers: int = _DEFAULT_MAX_WORKERS,
     ):
         self.protect_last_n = protect_last_n
         self.search_limit = search_limit
+        self.chunk_size = chunk_size
+        self.max_workers = max_workers
 
         # Token tracking (required by ABC)
         self.last_prompt_tokens = 0
@@ -266,8 +380,8 @@ class RLMContextEngine(ContextEngine):
         self._session_db = None
 
         logger.info(
-            "RLM context engine initialized: protect_last_n=%d search_limit=%d",
-            protect_last_n, search_limit,
+            "RLM context engine: protect_last_n=%d search_limit=%d chunk_size=%d max_workers=%d",
+            protect_last_n, search_limit, chunk_size, max_workers,
         )
 
     # -- SessionDB (lazy) --------------------------------------------------
@@ -286,28 +400,6 @@ class RLMContextEngine(ContextEngine):
         except Exception as exc:
             logger.warning("RLM: Failed to open SessionDB: %s", exc)
             return None
-
-    def _get_main_runtime(self) -> Dict[str, str]:
-        return {
-            "model": self.model,
-            "provider": self.provider,
-            "base_url": self.base_url,
-            "api_key": self.api_key,
-        }
-
-    def _get_db_path(self) -> Optional[str]:
-        """Return absolute path to state.db."""
-        if self._hermes_home:
-            p = self._hermes_home / "state.db"
-            if p.exists():
-                return str(p)
-        try:
-            from hermes_state import DEFAULT_DB_PATH
-            if DEFAULT_DB_PATH.exists():
-                return str(DEFAULT_DB_PATH)
-        except Exception:
-            pass
-        return None
 
     # -- ABC required methods ----------------------------------------------
 
@@ -328,10 +420,7 @@ class RLMContextEngine(ContextEngine):
         current_tokens: int = None,
         focus_topic: str = None,
     ) -> List[Dict[str, Any]]:
-        """Keep system prompt + recent tail, drop middle.
-
-        No LLM calls. Middle messages are already in state.db.
-        """
+        """Keep system prompt + recent tail, drop middle."""
         if len(messages) <= self.protect_last_n + 2:
             return messages
 
@@ -381,7 +470,6 @@ class RLMContextEngine(ContextEngine):
     _hook_registered = False
 
     def _ensure_hook_registered(self):
-        """Register pre_llm_call hook with the plugin system."""
         if RLMContextEngine._hook_registered:
             return
         try:
@@ -399,18 +487,16 @@ class RLMContextEngine(ContextEngine):
                         conversation_history: list, **kwargs) -> Optional[dict]:
         """Auto-retrieve archived context relevant to this turn's message.
 
-        Lightweight: FTS5 search + single sub-query via call_llm.
-        Runs synchronously (~1-3 seconds with a cheap model).
+        Lightweight: FTS5 search + single sub-query. ~1-3 seconds.
         """
         db = self._get_session_db()
         if db is None:
             return None
 
-        answer = retrieve(
+        answer = retrieve_lightweight(
             query=user_message,
             db=db,
             session_id=self._session_id or session_id,
-            main_runtime=self._get_main_runtime(),
             scope="current",
             limit=self.search_limit,
         )
@@ -419,18 +505,17 @@ class RLMContextEngine(ContextEngine):
 
         return {"context": f"Archived context (auto-retrieved):\n{answer}"}
 
-    # -- Tools (delegated, async) ------------------------------------------
+    # -- Tools (inline RLM pipeline) ---------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [{
             "name": "rlm_search",
             "description": (
-                "Deep search of archived conversation context. Spawns a "
-                "sub-agent that queries the session archive, chunks results, "
-                "and synthesizes an answer using a cheap model. Use for "
-                "complex queries, multi-chunk processing, or when you need "
-                "to search across all sessions. Runs asynchronously — you "
-                "can continue working while it processes."
+                "Deep search of archived conversation context. Runs the full "
+                "RLM pipeline: searches the archive, chunks results, and "
+                "processes each chunk in parallel using a cheap model, then "
+                "synthesizes findings into a coherent answer. Use for complex "
+                "queries or when you need to search across all sessions."
             ),
             "parameters": {
                 "type": "object",
@@ -473,27 +558,15 @@ class RLMContextEngine(ContextEngine):
         if db is None:
             return json.dumps({"error": "Session database not available"})
 
-        scope = args.get("scope", "current")
-        limit = args.get("limit", self.search_limit)
-        sort = args.get("sort", "relevance")
-
-        # Try delegated (async) path first — needs parent_agent from kwargs
-        parent_agent = kwargs.get("parent_agent")
-        if parent_agent is not None:
-            return self._delegate_search(
-                query=query, db=db, scope=scope, limit=limit, sort=sort,
-                parent_agent=parent_agent,
-            )
-
-        # Fallback: lightweight synchronous retrieval (same as pre_llm_call hook)
-        answer = retrieve(
+        answer = retrieve_full(
             query=query,
             db=db,
             session_id=self._session_id,
-            main_runtime=self._get_main_runtime(),
-            scope=scope,
-            limit=limit,
-            sort=sort,
+            scope=args.get("scope", "current"),
+            limit=args.get("limit", self.search_limit),
+            sort=args.get("sort", "relevance"),
+            chunk_size=self.chunk_size,
+            max_workers=self.max_workers,
         )
 
         if answer is None:
@@ -501,165 +574,14 @@ class RLMContextEngine(ContextEngine):
 
         return json.dumps({"answer": answer})
 
-    def _build_delegation_goal(
-        self,
-        query: str,
-        db_path: str,
-        session_ids: List[str],
-        limit: int,
-        sort: str,
-        aux_model: str,
-        aux_provider: str,
-    ) -> str:
-        """Build a self-contained goal for the delegated rlm_search child."""
-
-        session_clause = ""
-        if session_ids:
-            id_list = ", ".join(f"'{s}'" for s in session_ids)
-            session_clause = (
-                f"Only search these session IDs (in order from current to oldest): "
-                f"[{id_list}]. Add a WHERE clause: m.session_id IN ({id_list})"
-            )
-        else:
-            session_clause = "Search across ALL sessions (no session filter)."
-
-        model_instruction = ""
-        if aux_model:
-            model_instruction = (
-                f"For sub-queries on each chunk, call the OpenAI API with "
-                f"model=\"{aux_model}\""
-                + (f" via provider \"{aux_provider}\"" if aux_provider else "")
-                + ". Use the OPENAI_API_KEY environment variable for auth."
-            )
-        else:
-            model_instruction = (
-                "No auxiliary model configured. For sub-queries, use "
-                "OPENAI_API_KEY with a cheap model like gpt-4.1-nano."
-            )
-
-        return f"""You are an RLM retrieval agent. Your job is to search the
-Hermes conversation archive and answer a question by processing messages
-in chunks using a cheap LLM.
-
-DATABASE: {db_path}
-TABLES: messages (id, session_id, role, content, timestamp, active),
-        messages_fts (FTS5 virtual table on content)
-
-QUERY: {query}
-SCOPE: {session_clause}
-LIMIT: {limit} messages
-SORT: {sort}
-
-SUB-QUERY MODEL: {model_instruction}
-
-INSTRUCTIONS:
-1. Use `terminal` to run python3 and query state.db
-2. Search messages_fts using FTS5 MATCH syntax for keywords from the query
-3. If results are large (>5 messages), chunk them into groups of 3-5
-4. For each chunk, call the cheap model with the chunk content + the query
-   to extract relevant information
-5. Collect all chunk results
-6. If there are multiple chunk results, do one final synthesis call to
-   combine them into a coherent answer
-7. Your FINAL response should be the synthesized answer — this is returned
-   to the parent agent and injected into the conversation
-
-PYTHON EXAMPLE for step 2-3:
-```python
-import sqlite3
-conn = sqlite3.connect("{db_path}")
-conn.row_factory = sqlite3.Row
-rows = conn.execute(\"\"\"
-    SELECT m.id, m.session_id, m.role, m.content, m.timestamp
-    FROM messages_fts fts
-    JOIN messages m ON m.id = fts.rowid
-    WHERE messages_fts MATCH ?
-      AND m.active = 1
-    ORDER BY rank
-    LIMIT ?
-\"\"\", [search_terms, {limit}]).fetchall()
-# Then chunk rows and process each chunk
-```
-
-PYTHON EXAMPLE for step 4 (calling the cheap model):
-```python
-import os, json
-from openai import OpenAI
-client = OpenAI()  # uses OPENAI_API_KEY
-response = client.chat.completions.create(
-    model="{aux_model or 'gpt-4.1-nano'}",
-    messages=[{{"role": "user", "content": f"Given these messages: {{chunk}}\\n\\nAnswer: {query}"}}],
-    max_tokens=1024,
-)
-answer = response.choices[0].message.content
-```
-
-Be thorough. Chunk results if they're large. Don't send 50 messages to a
-single sub-query call — that's what the original RLM paper avoids.
-Process iteratively, like the REPL pattern."""
-
-    def _delegate_search(
-        self,
-        query: str,
-        db,
-        scope: str,
-        limit: int,
-        sort: str,
-        parent_agent,
-    ) -> str:
-        """Delegate rlm_search to a child agent via delegate_task.
-
-        The child runs the full RLM pipeline: FTS5 search → chunk →
-        sub-query cheap model per chunk → synthesize. Uses background=true
-        so the parent agent can continue working.
-        """
-        from tools.delegate_tool import delegate_task
-
-        # Resolve session lineage
-        lineage = []
-        if scope == "current" and self._session_id:
-            try:
-                lineage = _get_session_lineage(db, self._session_id)
-            except Exception:
-                lineage = [self._session_id]
-
-        db_path = self._get_db_path()
-        if not db_path:
-            return json.dumps({"error": "Session database not available"})
-
-        # Read auxiliary compression model from config
-        aux = _get_aux_model_info()
-        aux_model = aux.get("model", "")
-        aux_provider = aux.get("provider", "")
-
-        # Build the child's goal — fully self-contained
-        goal = self._build_delegation_goal(
-            query=query,
-            db_path=db_path,
-            session_ids=lineage,
-            limit=limit,
-            sort=sort,
-            aux_model=aux_model,
-            aux_provider=aux_provider,
-        )
-
-        # Delegate — background=true so parent isn't blocked
-        result = delegate_task(
-            goal=goal,
-            toolsets=["terminal", "file"],
-            role="leaf",
-            background=True,
-            parent_agent=parent_agent,
-        )
-
-        return result
-
     # -- Status ------------------------------------------------------------
 
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
         status["engine"] = "rlm"
         status["protect_last_n"] = self.protect_last_n
+        status["chunk_size"] = self.chunk_size
+        status["max_workers"] = self.max_workers
         status["compression_count"] = self.compression_count
         status["session_id"] = self._session_id
         return status
@@ -670,12 +592,7 @@ Process iteratively, like the REPL pattern."""
 # ===========================================================================
 
 def register(ctx):
-    """Register the RLM context engine.
-
-    Called by the Hermes plugin system. Handles both:
-    - _EngineCollector (directory-based loading): registers engine only
-    - PluginContext (general plugin system): registers engine + hook
-    """
+    """Register the RLM context engine."""
     engine = RLMContextEngine()
 
     if hasattr(ctx, "register_context_engine"):
