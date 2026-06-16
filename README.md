@@ -129,6 +129,19 @@ session_A → compress → session_B → compress → session_C → compress →
 | Quality of old context | Summary (may lose details) | Original messages (exact) |
 | Agent must actively retrieve | No (summary injected) | No (hook auto-retrieves) |
 
+### rlm_search (delegated, async)
+
+For the full RLM pipeline (chunk → sub-query per chunk → synthesize), a one-line change to Hermes core is needed to pass the parent agent reference to engine tool calls:
+
+```python
+# In agent/tool_executor.py, line ~1137, change:
+return agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages)
+# To:
+return agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages, parent_agent=agent)
+```
+
+Without this change, `rlm_search` falls back to lightweight synchronous retrieval (same as the hook). With it, `rlm_search` delegates to a child agent that runs the full RLM pipeline asynchronously.
+
 ## Limitations
 
 - **FTS5 is keyword search**, not semantic. The sub-query synthesis mitigates this — the model can understand context even if exact keywords don't match.
