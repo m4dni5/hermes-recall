@@ -1,11 +1,10 @@
-"""RLM Context Engine — retrieval-based context management.
+"""RLM plugin — search archived conversation context via RLM retrieval.
 
-Replaces lossy summarization with: archive everything, retrieve on demand.
-
-compress() keeps the system prompt + recent tail, drops the middle.
-rlm_search tool lets the agent pull old context via FTS5 + sub-query synthesis.
+Two modes:
+- Regular plugin: exposes rlm_search tool alongside default compressor
+- Context engine: replaces compressor (set context.engine: rlm in config)
 """
 
-from .engine import RLMContextEngine
+from .engine import RLMContextEngine, register  # noqa: F401
 
-__all__ = ["RLMContextEngine"]
+__all__ = ["RLMContextEngine", "register"]
