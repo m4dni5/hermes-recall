@@ -112,10 +112,10 @@ def _get_session_db(hermes_home: Optional[Path] = None):
 
 
 def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
-    """Call the auxiliary compression model."""
+    """Call the RLM auxiliary model (auxiliary.rlm in config.yaml)."""
     from agent.auxiliary_client import call_llm
     response = call_llm(
-        task="compression",
+        task="rlm",
         main_runtime={},
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
@@ -386,7 +386,26 @@ def register(ctx):
     If context.engine == "rlm" in config.yaml, registers as a context engine
     (replaces the built-in compressor). Otherwise, registers rlm_search as
     a standalone tool that works alongside whatever compressor is active.
+
+    In both modes, registers auxiliary.rlm task so RLM has its own config
+    section independent of auxiliary.compression.
     """
+    # Register the RLM auxiliary task — gives us auxiliary.rlm in config.yaml
+    # independent of auxiliary.compression. Falls through silently if ctx
+    # doesn't support register_auxiliary_task (e.g. _EngineCollector).
+    if hasattr(ctx, "register_auxiliary_task"):
+        ctx.register_auxiliary_task(
+            key="rlm",
+            display_name="RLM retrieval",
+            description="Recursive Language Model sub-queries for archived context retrieval",
+            defaults={
+                "provider": "auto",
+                "model": "",
+                "timeout": 60,
+            },
+        )
+        logger.info("RLM: registered auxiliary.rlm task")
+
     # Check if we should be the context engine
     is_context_engine = False
     try:

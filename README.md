@@ -33,11 +33,12 @@ Replace the built-in compressor entirely. compress() trims to a tail (instant, n
 context:
   engine: "rlm"
 
-# Cheap model for sub-queries (important!)
+# RLM has its own auxiliary config section
 auxiliary:
-  compression:
+  rlm:
     model: "gpt-4.1-nano"
     provider: "openrouter"
+    timeout: 60
 ```
 
 ```bash
@@ -88,7 +89,7 @@ Session lineage (`parent_session_id` chains) connects compressed sessions. rlm_s
 ## Dependencies
 
 - `repl.py` — adapted from [rlm-minimal](https://github.com/alexzhang13/rlm)
-- Uses `call_llm(task="compression")` for sub-queries — routes through `auxiliary.compression.model` config
+- Uses `call_llm(task="rlm")` for sub-queries — routes through `auxiliary.rlm` config (falls back to auto-detection if not configured)
 - Reads state.db via Hermes's `SessionDB`
 
 ## Files

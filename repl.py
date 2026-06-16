@@ -1,9 +1,9 @@
 """REPL environment for RLM deep-dive searches.
 
 Adapted from rlm-minimal (https://github.com/alexzhang13/rlm).
-Uses Hermes's call_llm(task="compression") for sub-queries instead of
+Uses Hermes's call_llm(task="rlm") for sub-queries instead of
 a direct OpenAI client, so it automatically picks up the auxiliary model
-configured in auxiliary.compression.model.
+configured in auxiliary.rlm (or falls back to auxiliary.compression).
 """
 
 import io
@@ -39,7 +39,7 @@ class REPLEnv:
     """Sandboxed Python REPL with llm_query() and context access.
 
     Adapted from rlm-minimal's REPLEnv. Key changes:
-    - llm_query() uses Hermes's call_llm(task="compression") instead of
+    - llm_query() uses Hermes's call_llm(task="rlm") instead of
       a direct OpenAI client, so it picks up auxiliary.compression.model.
     - Logging stripped (no repl_env_logger).
     - Context loaded from a string (FTS5 search results).
@@ -83,13 +83,13 @@ class REPLEnv:
         # Load context into the REPL
         self._load_context(context_str)
 
-        # Expose llm_query — uses Hermes's auxiliary model routing
+        # Expose llm_query — uses Hermes's auxiliary.rlm model config
         def llm_query(prompt: str) -> str:
-            """Query the cheap model via Hermes's auxiliary compression config."""
+            """Query the RLM model via auxiliary.rlm config."""
             from agent.auxiliary_client import call_llm
             try:
                 response = call_llm(
-                    task="compression",
+                    task="rlm",
                     main_runtime={},
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=self.max_llm_tokens,
@@ -310,7 +310,7 @@ def run_rlm_repl(
         messages.append(next_action_prompt(query, i))
 
         response = call_llm(
-            task="compression",
+            task="rlm",
             main_runtime={},
             messages=messages,
             max_tokens=2048,
@@ -356,7 +356,7 @@ def run_rlm_repl(
     # Max iterations — force a final answer
     messages.append(final_answer_prompt(query))
     response = call_llm(
-        task="compression",
+        task="rlm",
         main_runtime={},
         messages=messages,
         max_tokens=2048,
