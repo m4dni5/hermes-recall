@@ -6,20 +6,25 @@ Hermes Agent context engine plugin — replaces lossy summarization with retriev
 
 Standard Hermes compresses context by summarizing old messages (lossy, slow, uses an LLM call).
 
-This plugin: **nothing is discarded.** All messages stay in `state.db`. The context window is trimmed to a recent tail, and the agent gets an `rlm_search` tool to retrieve archived context on demand.
+This plugin: **nothing is discarded.** All messages stay in `state.db`. The context window is trimmed to a recent tail, and archived context is **automatically retrieved** every turn via a `pre_llm_call` hook.
 
 ```
 Standard:  [system] [...middle...] → summarize (LLM) → [system] [summary] [tail]
 RLM:       [system] [...middle...] → drop (instant)  → [system] [note] [tail]
-                                                          ↓ agent needs old context
-                                                    rlm_search("what about X?")
-                                                          ↓
-                                                    FTS5 search state.db
-                                                          ↓
-                                                    sub-query cheap model
-                                                          ↓
-                                                    synthesized answer
+                                                          ↓ every turn, automatic
+                                                    pre_llm_call hook:
+                                                      FTS5 search state.db
+                                                      sub-query cheap model
+                                                      inject synthesized context
 ```
+
+### Three layers
+
+| Layer | What | When | How |
+|-------|------|------|-----|
+| `compress()` | Trim to tail | Context pressure | Instant — no LLM |
+| `pre_llm_call` hook | Auto-retrieve relevant context | Every turn | FTS5 → sub-query → inject |
+| `rlm_search` tool | Explicit deep dive | Agent-initiated | Custom query, scope, sort |
 
 ## Installation
 
@@ -120,16 +125,17 @@ session_A → compress → session_B → compress → session_C → compress →
 | Old messages | Summarized (lossy) | Archived in state.db (lossless) |
 | LLM calls on compression | Yes (aux model) | No |
 | Compression speed | Slow (LLM round-trip) | Instant (list slice) |
-| Retrieval of old context | Not possible | `rlm_search` with FTS5 + sub-query |
+| Retrieval of old context | Not possible (summary only) | Automatic every turn + explicit tool |
 | Quality of old context | Summary (may lose details) | Original messages (exact) |
-| Agent must actively retrieve | No (summary injected) | Yes (must call rlm_search) |
+| Agent must actively retrieve | No (summary injected) | No (hook auto-retrieves) |
 
 ## Limitations
 
-- **FTS5 is keyword search**, not semantic. Agent must phrase queries matching original text.
+- **FTS5 is keyword search**, not semantic. The sub-query synthesis mitigates this — the model can understand context even if exact keywords don't match.
+- **Per-turn latency**: the `pre_llm_call` hook adds 1-3 seconds (aux model round-trip). With `gpt-4.1-nano` this is fast; with a slower model it adds up.
+- **Per-turn cost**: every turn burns tokens on the auxiliary model. With a cheap model, this is negligible. Without `auxiliary.compression.model` set, it falls back to the main model (expensive).
+- **No chunk result caching.** Every turn re-runs the full pipeline. Future: cache recent results.
 - **Sub-query uses a single LLM call.** Very large result sets may exceed the aux model's window.
-- **No chunk result caching.** Every search re-runs the full pipeline.
-- **Agent must know to call rlm_search.** The context note helps but isn't foolproof.
 
 ## Files
 
