@@ -351,11 +351,15 @@ class RLMContextEngine(ContextEngine):
         search_limit: int = _DEFAULT_SEARCH_LIMIT,
         chunk_size: int = _DEFAULT_CHUNK_SIZE,
         max_workers: int = _DEFAULT_MAX_WORKERS,
+        max_iterations: int = 8,
+        max_llm_tokens: int = 1024,
     ):
         self.protect_last_n = protect_last_n
         self.search_limit = search_limit
         self.chunk_size = chunk_size
         self.max_workers = max_workers
+        self.max_iterations = max_iterations
+        self.max_llm_tokens = max_llm_tokens
 
         # Token tracking (required by ABC)
         self.last_prompt_tokens = 0
@@ -558,21 +562,57 @@ class RLMContextEngine(ContextEngine):
         if db is None:
             return json.dumps({"error": "Session database not available"})
 
-        answer = retrieve_full(
-            query=query,
-            db=db,
-            session_id=self._session_id,
-            scope=args.get("scope", "current"),
-            limit=args.get("limit", self.search_limit),
-            sort=args.get("sort", "relevance"),
-            chunk_size=self.chunk_size,
-            max_workers=self.max_workers,
-        )
+        scope = args.get("scope", "current")
+        limit = args.get("limit", self.search_limit)
+        sort = args.get("sort", "relevance")
 
-        if answer is None:
+        # Step 1: FTS5 search to gather initial context
+        try:
+            if scope == "current" and self._session_id:
+                lineage = _get_session_lineage(db, self._session_id)
+                results = _search_scoped(db, query, session_ids=lineage,
+                                         limit=limit, sort=sort)
+            else:
+                results = db.search_messages(
+                    query=query, limit=limit,
+                    sort=sort if sort in ("newest", "oldest") else None,
+                )
+        except Exception as exc:
+            return json.dumps({"error": f"Search failed: {exc}"})
+
+        if not results:
             return json.dumps({"answer": "No relevant messages found.", "results_count": 0})
 
-        return json.dumps({"answer": answer})
+        # Format as context string
+        context = "\n\n".join(_format_message(m) for m in results)
+
+        # Step 2: Run the RLM REPL — model writes code to process context
+        from repl import run_rlm_repl
+
+        try:
+            answer = run_rlm_repl(
+                context=context,
+                query=query,
+                max_iterations=self.max_iterations,
+                max_llm_tokens=self.max_llm_tokens,
+            )
+        except Exception as exc:
+            logger.warning("RLM REPL failed, falling back to direct synthesis: %s", exc)
+            # Fallback: single sub-query
+            try:
+                answer = _call_aux_model(
+                    f"Answer this question using the archived messages.\n\n"
+                    f"Question: {query}\n\nMessages:\n{context}",
+                    max_tokens=_DEFAULT_MAX_AGG_TOKENS,
+                )
+            except Exception as exc2:
+                return json.dumps({"error": f"Both REPL and fallback failed: {exc2}"})
+
+        return json.dumps({
+            "answer": answer,
+            "results_count": len(results),
+            "method": "repl",
+        })
 
     # -- Status ------------------------------------------------------------
 
