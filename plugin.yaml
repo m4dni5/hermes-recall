@@ -1,0 +1,5 @@
+name: rlm
+description: "RLM retrieval-based context engine — archives all messages, retrieves on demand via sub-queries"
+version: 0.1.0
+author: matt
+license: MIT
