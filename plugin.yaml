@@ -1,5 +1,5 @@
 name: rlm
-description: "RLM retrieval-based context engine — archives all messages, retrieves on demand via sub-queries"
-version: 0.1.0
+description: "RLM retrieval — search archived conversation context via REPL-based deep dives"
+version: 0.2.0
 author: matt
 license: MIT

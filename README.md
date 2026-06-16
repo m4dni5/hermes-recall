@@ -1,173 +1,102 @@
 # rlm-hermes
 
-Hermes Agent context engine plugin — replaces lossy summarization with retrieval-based context management inspired by [Recursive Language Models](https://github.com/alexzhang13/rlm) ([paper](https://arxiv.org/abs/2512.24601v1)).
+Hermes Agent plugin — search archived conversation context using [Recursive Language Models](https://arxiv.org/abs/2512.24601v1).
 
-## How it works
+Works in two modes:
 
-Standard Hermes compresses context by summarizing old messages (lossy, slow, uses an LLM call).
+## Mode 1: Regular Plugin (recommended to start)
 
-This plugin: **nothing is discarded.** All messages stay in `state.db`. The context window is trimmed to a recent tail, and archived context is **automatically retrieved** every turn via a `pre_llm_call` hook.
+Drop into `~/.hermes/plugins/rlm/` and restart. Gives the agent an `rlm_search` tool that works **alongside the default compressor**.
 
 ```
-Standard:  [system] [...middle...] → summarize (LLM) → [system] [summary] [tail]
-RLM:       [system] [...middle...] → drop (instant)  → [system] [note] [tail]
-                                                          ↓ every turn, automatic
-                                                    pre_llm_call hook:
-                                                      FTS5 search state.db
-                                                      sub-query cheap model
-                                                      inject synthesized context
+User: "What did we decide about the auth flow?"
+  → Agent doesn't have old context (it was compressed)
+  → Agent calls rlm_search(query="auth flow decision")
+  → Plugin loads ALL messages from session lineage into state.db
+  → REPL model writes Python to search, chunk, and process
+  → Answer injected into conversation
 ```
 
-### Three layers
-
-| Layer | What | When | How |
-|-------|------|------|-----|
-| `compress()` | Trim to tail | Context pressure | Instant — no LLM |
-| `pre_llm_call` hook | Auto-retrieve relevant context | Every turn | FTS5 → sub-query → inject |
-| `rlm_search` tool | Explicit deep dive | Agent-initiated | Custom query, scope, sort |
-
-## Installation
+**No config changes needed.** The default compressor handles context management normally. rlm_search recovers compressed history on demand.
 
 ```bash
-# Symlink into Hermes plugin directory
-ln -s ~/src/rlm-hermes ~/.hermes/hermes-agent/plugins/context_engine/rlm
+ln -s ~/src/rlm-hermes ~/.hermes/plugins/rlm
+# Restart Hermes — that's it
 ```
 
-## Configuration
+## Mode 2: Context Engine
 
-Add to `~/.hermes/config.yaml`:
-
-```yaml
-context:
-  engine: "rlm"
-```
-
-Then restart Hermes (CLI: exit and relaunch; gateway: `hermes gateway restart`).
-
-### Auxiliary model (important)
-
-The `rlm_search` tool uses a sub-query model to synthesize search results. Without config, it falls back to your **main model** — expensive for a retrieval task.
-
-Set a cheap model:
+Replace the built-in compressor entirely. compress() trims to a tail (instant, no LLM), pre_llm_call hook auto-retrieves each turn, rlm_search does deep dives.
 
 ```yaml
-auxiliary:
-  compression:
-    model: "gpt-4.1-nano"        # or gemini-flash, etc.
-    provider: "openrouter"        # or "nous", "auto"
-```
-
-This is the same config that controls Hermes's built-in compression summarizer. The RLM engine piggybacks on it via `call_llm(task="compression")`.
-
-**Without this, every rlm_search call uses your main model (e.g. Claude Sonnet) for a simple synthesis task.** With a cheap model, retrieval costs ~10x less.
-
-### Full example
-
-```yaml
+# ~/.hermes/config.yaml
 context:
   engine: "rlm"
 
+# Cheap model for sub-queries (important!)
 auxiliary:
   compression:
     model: "gpt-4.1-nano"
     provider: "openrouter"
-
-# These still apply to the main model's context window:
-compression:
-  threshold: 0.50              # when to trigger (0.20 for aggressive archiving)
-  protect_last_n: 20           # tail messages to keep
 ```
 
-## How compress() works
-
-When the main model's context window fills up:
-
-1. Messages are already persisted to `state.db` by the normal flush loop
-2. `compress()` returns: system prompt + context note + last N messages
-3. Middle messages are gone from the **active window** but still in `state.db`
-4. The context note tells the agent about `rlm_search`
-
-No LLM calls. No summarization. Instant.
+```bash
+ln -s ~/src/rlm-hermes ~/.hermes/hermes-agent/plugins/context_engine/rlm
+hermes config set context.engine rlm
+hermes gateway restart  # or restart CLI
+```
 
 ## How rlm_search works
 
-When the agent calls `rlm_search(query="what did we decide about the auth flow")`:
+The plugin adapts the original RLM REPL pattern:
 
-1. Walks the session lineage (`parent_session_id` chain) to find all ancestor sessions
-2. **FTS5 search** scoped to the lineage (or all sessions with `scope: "all"`)
-3. Chunks the search results
-4. Sub-queries a cheap model: "given these results, answer the question"
-5. Returns the synthesized answer
+1. **Load context** — all messages from session lineage (no pre-filtering)
+2. **REPL loop** — model writes Python code to process the context:
+   ```python
+   # Model writes this kind of code automatically
+   lines = context.split('\n\n')
+   auth_lines = [l for l in lines if 'auth' in l.lower()]
+   for chunk in auth_lines[:10]:
+       print(llm_query(f"What's the decision? {chunk}"))
+   ```
+3. **Sub-queries** — `llm_query()` calls the cheap model (auxiliary.compression.model)
+4. **Iterate** — model sees results, refines approach, writes more code
+5. **FINAL()** — model signals completion with final answer
 
-### Parameters
+The context is a Python **variable**, not a prompt. The model accesses it programmatically — no token limit applies to the context itself.
 
-| Param | Default | Description |
-|-------|---------|-------------|
-| `query` | required | Natural language query |
-| `scope` | `"current"` | `"current"` = session lineage only, `"all"` = all sessions |
-| `sort` | `"relevance"` | `"relevance"`, `"newest"`, `"oldest"` |
-| `limit` | `50` | Max messages to retrieve |
+## Works with default compressor
 
-## Session lineage with multiple compressions
-
-With aggressive compression (e.g. 20% threshold), compressions fire more often, creating a longer chain:
+**Key insight:** the built-in compressor summarizes in-memory messages, but ALL original messages are persisted to state.db **before** compression happens. The flush loop writes each message to state.db as it's produced. When compression fires, the originals are already archived.
 
 ```
-session_A → compress → session_B → compress → session_C → compress → session_D (current)
+Turn 1-50: messages flushed to state.db (originals preserved)
+Compress:  in-memory messages → summary + tail
+Turn 51+:  new messages flushed to state.db
+rlm_search: loads ALL messages from session lineage → original context restored
 ```
 
-`rlm_search(scope="current")` walks `D → C → B → A` and searches all of them. FTS5 across 10+ sessions is still sub-millisecond.
+Session lineage (`parent_session_id` chains) connects compressed sessions. rlm_search walks the chain and loads everything.
 
-## Comparison with built-in compressor
+## Two layers (Mode 2 only)
 
-| | Built-in `compressor` | RLM engine |
-|-|----------------------|------------|
-| Old messages | Summarized (lossy) | Archived in state.db (lossless) |
-| LLM calls on compression | Yes (aux model) | No |
-| Compression speed | Slow (LLM round-trip) | Instant (list slice) |
-| Retrieval of old context | Not possible (summary only) | Automatic every turn + explicit tool |
-| Quality of old context | Summary (may lose details) | Original messages (exact) |
-| Agent must actively retrieve | No (summary injected) | No (hook auto-retrieves) |
+| Layer | Trigger | Speed | How |
+|-------|---------|-------|-----|
+| `pre_llm_call` hook | Every turn | ~1-3s | Loads context → single sub-query → inject |
+| `rlm_search` tool | Agent-initiated | ~10-30s | Full REPL with model agency |
 
-### rlm_search (inline RLM pipeline)
+## Dependencies
 
-The `rlm_search` tool runs the full RLM pipeline inline — no delegation, no subprocess, no agent spawning:
-
-1. FTS5 search across session lineage
-2. Chunk results into groups of N messages
-3. Sub-query the cheap model on each chunk **in parallel** (ThreadPoolExecutor)
-4. Synthesize chunk findings into a coherent answer
-
-Parallel sub-queries with `gpt-4.1-nano` complete in ~3-5 seconds total, even for large result sets.
-
-```yaml
-# Optional tuning (defaults shown)
-context:
-  engine: "rlm"
-  rlm:
-    chunk_size: 5        # messages per chunk
-    max_workers: 4       # parallel sub-queries
-```
-
-## Limitations
-
-- **FTS5 is keyword search**, not semantic. The sub-query synthesis mitigates this — the model can understand context even if exact keywords don't match.
-- **Per-turn latency**: the `pre_llm_call` hook adds 1-3 seconds (aux model round-trip). With `gpt-4.1-nano` this is fast; with a slower model it adds up.
-- **Per-turn cost**: every turn burns tokens on the auxiliary model. With a cheap model, this is negligible. Without `auxiliary.compression.model` set, it falls back to the main model (expensive).
-- **No chunk result caching.** Every turn re-runs the full pipeline. Future: cache recent results.
-- **Sub-query uses a single LLM call.** Very large result sets may exceed the aux model's window.
+- `repl.py` — adapted from [rlm-minimal](https://github.com/alexzhang13/rlm)
+- Uses `call_llm(task="compression")` for sub-queries — routes through `auxiliary.compression.model` config
+- Reads state.db via Hermes's `SessionDB`
 
 ## Files
 
 ```
 __init__.py      # exports RLMContextEngine
-plugin.yaml      # plugin metadata
-engine.py        # ContextEngine implementation (~350 lines)
+plugin.yaml      # metadata
+engine.py        # both modes: context engine + regular plugin tool
+repl.py          # REPL sandbox (adapted from rlm-minimal)
 README.md        # this file
 ```
-
-## See also
-
-- [rlm-minimal](https://github.com/alexzhang13/rlm) — original RLM implementation this is inspired by
-- [Hermes Context Engine Plugin docs](https://hermes-agent.nousresearch.com/docs/developer-guide/context-engine-plugin)
-- [Hermes Context Compression docs](https://hermes-agent.nousresearch.com/docs/developer-guide/context-compression-and-caching)
