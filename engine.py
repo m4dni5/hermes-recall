@@ -13,6 +13,7 @@ MODE 2: Regular Plugin (just install as a plugin)
 
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -216,12 +217,17 @@ def execute_rlm_search(
         return json.dumps({"answer": "No messages found.", "results_count": 0})
 
     # Run the RLM REPL
-    from repl import run_rlm_repl
+    sys.path.insert(0, str(Path(__file__).parent))
 
+    from repl import run_rlm_repl
     try:
-        answer = run_rlm_repl(context=context, query=query)
+        answer = run_rlm_repl(
+            context=context, query=query,
+            hermes_home=str(hermes_home) if hermes_home else None,
+            session_ids=lineage if lineage else None,
+        )
     except Exception as exc:
-        logger.warning("RLM REPL failed, falling back: %s", exc)
+        logger.warning("RLM REPL failed, falling back to direct aux model: %s", exc)
         try:
             answer = _call_aux_model(
                 f"Answer using these archived messages.\n\n"
@@ -236,6 +242,7 @@ def execute_rlm_search(
         "results_count": message_count,
         "method": "repl",
     })
+
 
 
 # ===========================================================================
