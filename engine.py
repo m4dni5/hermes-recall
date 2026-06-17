@@ -82,12 +82,15 @@ def _messages_to_json(messages: List[Dict[str, Any]]) -> List[dict]:
     """Convert raw messages to compact JSON-serializable format."""
     result = []
     for i, msg in enumerate(messages):
-        result.append({
+        entry = {
             "i": i,
             "sid": msg.get("session_id", ""),
             "role": msg.get("role", "unknown"),
             "content": msg.get("content", "") or "",
-        })
+        }
+        if "id" in msg:
+            entry["mid"] = msg["id"]  # message DB id for FTS5 matching
+        result.append(entry)
     return result
 
 
@@ -98,18 +101,19 @@ def _load_messages_from_lineage(db, session_ids: List[str]) -> List[Dict[str, An
     placeholders = ",".join("?" for _ in session_ids)
     with db._lock:
         rows = db._conn.execute(
-            f"SELECT session_id, role, content FROM messages "
+            f"SELECT id, session_id, role, content FROM messages "
             f"WHERE session_id IN ({placeholders}) AND active = 1 ORDER BY id",
             session_ids,
         ).fetchall()
     messages = []
     for row in rows:
-        sid = row["session_id"] if hasattr(row, "keys") else row[0]
-        role = row["role"] if hasattr(row, "keys") else row[1]
-        content = row["content"] if hasattr(row, "keys") else row[2]
+        mid = row["id"] if hasattr(row, "keys") else row[0]
+        sid = row["session_id"] if hasattr(row, "keys") else row[1]
+        role = row["role"] if hasattr(row, "keys") else row[2]
+        content = row["content"] if hasattr(row, "keys") else row[3]
         if content:
             content = db._decode_content(content)
-            messages.append({"session_id": sid, "role": role, "content": content})
+            messages.append({"id": mid, "session_id": sid, "role": role, "content": content})
     return messages
 
 
@@ -147,30 +151,21 @@ def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
 def _fts_hits_to_indices(fts_hits: list, messages_json: List[dict]) -> List[int]:
     """Convert FTS5 search results to indices into the messages_json array.
 
-    Matches by session_id + role + content prefix (first 100 chars).
+    Matches by message DB id (mid field).
     """
     if not fts_hits or not messages_json:
         return []
-    # Build lookup: (session_id, role, content_prefix) -> index
-    lookup = {}
+    # Build lookup: message_db_id -> json_index
+    mid_lookup = {}
     for i, msg in enumerate(messages_json):
-        key = (msg.get("sid", ""), msg.get("role", ""), msg.get("content", "")[:100])
-        lookup[key] = i
+        if "mid" in msg:
+            mid_lookup[msg["mid"]] = i
 
     indices = []
     for hit in fts_hits:
-        sid = hit.get("session_id", "")
-        role = hit.get("role", "")
-        content = hit.get("content", "")[:100]
-        key = (sid, role, content)
-        if key in lookup:
-            indices.append(lookup[key])
-        else:
-            # Fallback: match by session_id + role only
-            for i, msg in enumerate(messages_json):
-                if msg.get("sid") == sid and msg.get("role") == role:
-                    indices.append(i)
-                    break
+        hit_id = hit.get("id")
+        if hit_id is not None and hit_id in mid_lookup:
+            indices.append(mid_lookup[hit_id])
     return sorted(set(indices))
 
 
@@ -232,17 +227,18 @@ def execute_rlm_search(
             # scope=all — load everything
             with db._lock:
                 rows = db._conn.execute(
-                    "SELECT session_id, role, content FROM messages "
+                    "SELECT id, session_id, role, content FROM messages "
                     "WHERE active = 1 ORDER BY id"
                 ).fetchall()
             raw_messages = []
             for row in rows:
-                sid = row["session_id"] if hasattr(row, "keys") else row[0]
-                role = row["role"] if hasattr(row, "keys") else row[1]
-                content = row["content"] if hasattr(row, "keys") else row[2]
+                mid = row["id"] if hasattr(row, "keys") else row[0]
+                sid = row["session_id"] if hasattr(row, "keys") else row[1]
+                role = row["role"] if hasattr(row, "keys") else row[2]
+                content = row["content"] if hasattr(row, "keys") else row[3]
                 if content:
                     content = db._decode_content(content)
-                    raw_messages.append({"session_id": sid, "role": role, "content": content})
+                    raw_messages.append({"id": mid, "session_id": sid, "role": role, "content": content})
 
         messages_json = _messages_to_json(raw_messages)
     except Exception as exc:

@@ -41,23 +41,24 @@ def load_messages_from_db(hermes_home: str, session_id: str = None, scope: str =
     if scope == "all":
         with db._lock:
             rows = db._conn.execute(
-                "SELECT session_id, role, content FROM messages "
+                "SELECT id, session_id, role, content FROM messages "
                 "WHERE active = 1 ORDER BY id LIMIT ?",
                 (limit,),
             ).fetchall()
     else:
         from engine import _load_messages_from_lineage
         raw = _load_messages_from_lineage(db, lineage)
-        rows = [{"session_id": m["session_id"], "role": m["role"], "content": m["content"]} for m in raw[:limit]]
+        rows = [{"id": m["id"], "session_id": m["session_id"], "role": m["role"], "content": m["content"]} for m in raw[:limit]]
 
     messages = []
     for i, row in enumerate(rows):
-        sid = row["session_id"] if hasattr(row, "keys") else row[0]
-        role = row["role"] if hasattr(row, "keys") else row[1]
-        content = row["content"] if hasattr(row, "keys") else row[2]
+        mid = row["id"] if hasattr(row, "keys") else row[0]
+        sid = row["session_id"] if hasattr(row, "keys") else row[1]
+        role = row["role"] if hasattr(row, "keys") else row[2]
+        content = row["content"] if hasattr(row, "keys") else row[3]
         if content:
             content = db._decode_content(content)
-            messages.append({"i": i, "sid": sid, "role": role, "content": content})
+            messages.append({"i": i, "mid": mid, "sid": sid, "role": role, "content": content})
 
     return messages
 
@@ -105,16 +106,16 @@ def main():
         db = SessionDB(Path(args.hermes_home) / "state.db")
         results = db.search_messages(args.query, limit=10)
         if results:
-            # Convert to indices
-            lookup = {}
+            # Convert to indices using message IDs
+            mid_lookup = {}
             for i, msg in enumerate(messages_json):
-                key = (msg.get("sid", ""), msg.get("role", ""), msg.get("content", "")[:100])
-                lookup[key] = i
+                if "mid" in msg:
+                    mid_lookup[msg["mid"]] = i
             fts_hints = []
             for hit in results:
-                key = (hit.get("session_id", ""), hit.get("role", ""), hit.get("content", "")[:100])
-                if key in lookup:
-                    fts_hints.append(lookup[key])
+                hit_id = hit.get("id")
+                if hit_id is not None and hit_id in mid_lookup:
+                    fts_hints.append(mid_lookup[hit_id])
             fts_hints = sorted(set(fts_hints))
             print(f"FTS5 found {len(results)} results → {len(fts_hints)} message indices: {fts_hints}")
         else:

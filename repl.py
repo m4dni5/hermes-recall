@@ -312,9 +312,7 @@ def find_final_answer(text: str) -> Optional[Tuple[str, str]]:
 
 REPL_SYSTEM_PROMPT = """You are tasked with answering a query using archived conversation messages. You have access to a REPL environment where you can write Python code to process the data and query a sub-LLM.
 
-Your context is a JSON array of {message_count} messages across {session_count} sessions ({total_chars} total characters), stored in a `messages` variable.
-
-Each message is a dict: {{"i": index, "sid": "session_id", "role": "user"|"assistant"|"tool", "content": "..."}}
+Your context is a JSON array of {message_count} messages across {session_count} sessions ({total_chars} total characters), stored in a `messages` variable. Each message has keys: i, sid, role, content.
 
 Sample of the first few messages:
 {preview}
@@ -423,10 +421,7 @@ def run_rlm_repl(
     # Build preview
     preview_lines = []
     for msg in messages_json[:5]:
-        sid = msg.get("sid", "?")
-        role = msg.get("role", "?")
-        content = msg.get("content", "")[:200]
-        preview_lines.append(f'[session:{sid} role:{role}] {content}')
+        preview_lines.append(json.dumps(msg, ensure_ascii=False)[:200])
     preview = "\n".join(preview_lines) if preview_lines else "(empty)"
 
     # Build search hints from pre-computed FTS5 hits
