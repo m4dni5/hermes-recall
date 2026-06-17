@@ -290,7 +290,7 @@ class REPLEnv:
 # ---------------------------------------------------------------------------
 
 def find_code_blocks(text: str) -> List[str]:
-    """Find ```repl ... ``` code blocks in model output."""
+    """Find ```repl code blocks in model output."""
     pattern = r'```repl\s*\n(.*?)\n```'
     return [m.group(1).strip() for m in re.finditer(pattern, text, re.DOTALL)]
 
@@ -344,6 +344,7 @@ else:
 ```
 
 CRITICAL RULES:
+- Write all code inside ```repl ... ``` code blocks. Do NOT use XML tags or any other format.
 - Execute code immediately, don't just describe what you'd do.
 - Use llm_query liberally — it's cheap and fast.
 - You MUST end with FINAL(your complete answer on a single line). This is the ONLY way to return your answer.
