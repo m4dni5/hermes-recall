@@ -1,39 +1,59 @@
-# rlm-hermes
+# hermes-rlm
 
-Hermes Agent plugin — search archived conversation context using [Recursive Language Models](https://arxiv.org/abs/2512.24601v1).
+Hermes Agent context engine plugin — lossless conversation archival with recursive search.
 
-Works in two modes:
+Based on [Recursive Language Models](https://arxiv.org/abs/2512.24601) (arXiv:2512.24601v3).
+Adapted from [rlm-minimal](https://github.com/alexzhang13/rlm).
 
-## Mode 1: Regular Plugin (recommended to start)
+## What it does
 
-Drop into `~/.hermes/plugins/rlm/` and restart. Gives the agent an `rlm_search` tool that works **alongside the default compressor**.
+Replaces lossy context compression with structured archival. When context pressure hits:
+
+1. **Compress** — evicted messages are serialized to JSON (no summarization, no loss)
+2. **Hint** — a pre_llm_call hook runs FTS5 on the user's message and injects a metadata hint: "N messages match this topic. Call rlm_search."
+3. **Search** — `rlm_search` loads the JSON archive into a REPL where the model writes Python to filter, query, and synthesize answers
+
+The model gets a `messages` variable (JSON array) it can reason about programmatically. No token limit applies to the archive itself.
+
+## Architecture
 
 ```
-User: "What did we decide about the auth flow?"
-  → Agent doesn't have old context (it was compressed)
-  → Agent calls rlm_search(query="auth flow decision")
-  → Plugin loads ALL messages from session lineage into state.db
-  → REPL model writes Python to search, chunk, and process
-  → Answer injected into conversation
+User message
+  → pre_llm_call hook: FTS5 search → metadata hint (1 line in context)
+  → LLM call (with last N messages + hint)
+  → if rlm_search called:
+      → JSON archive loaded into REPL
+      → FTS5 hints pre-loaded (indices from hook)
+      → model writes Python: search_context() → messages[idx] → llm_query()
+      → FINAL() returns answer
 ```
 
-**No config changes needed.** The default compressor handles context management normally. rlm_search recovers compressed history on demand.
+Three layers the model uses:
+
+| Layer | What | Speed |
+|-------|------|-------|
+| `search_context(query)` | FTS5 → message indices | fast |
+| `messages[idx]` | Full structured data | instant |
+| `llm_query(prompt)` | Sub-LLM semantic analysis | ~1-3s |
+
+## Install
 
 ```bash
-ln -s ~/src/rlm-hermes ~/.hermes/plugins/rlm
+ln -s ~/src/hermes-rlm ~/.hermes/plugins/rlm
 # Restart Hermes — that's it
 ```
 
-## Mode 2: Context Engine
+No config changes needed. Works alongside the default compressor. rlm_search recovers archived history on demand.
 
-Replace the built-in compressor entirely. compress() trims to a tail (instant, no LLM), pre_llm_call hook auto-retrieves each turn, rlm_search does deep dives.
+## Context engine mode (optional)
+
+Replace the built-in compressor entirely:
 
 ```yaml
 # ~/.hermes/config.yaml
 context:
   engine: "rlm"
 
-# RLM has its own auxiliary config section
 auxiliary:
   rlm:
     model: "gpt-4.1-nano"
@@ -42,62 +62,38 @@ auxiliary:
 ```
 
 ```bash
-ln -s ~/src/rlm-hermes ~/.hermes/hermes-agent/plugins/context_engine/rlm
+ln -s ~/src/hermes-rlm ~/.hermes/hermes-agent/plugins/context_engine/rlm
 hermes config set context.engine rlm
-hermes gateway restart  # or restart CLI
+hermes gateway restart
 ```
 
-## How rlm_search works
+## Test harness
 
-The plugin adapts the original RLM REPL pattern:
+Simulates a compression event from real session history:
 
-1. **Load context** — all messages from session lineage (no pre-filtering)
-2. **REPL loop** — model writes Python code to process the context:
-   ```python
-   # Model writes this kind of code automatically
-   lines = context.split('\n\n')
-   auth_lines = [l for l in lines if 'auth' in l.lower()]
-   for chunk in auth_lines[:10]:
-       print(llm_query(f"What's the decision? {chunk}"))
-   ```
-3. **Sub-queries** — `llm_query()` calls the cheap model (auxiliary.compression.model)
-4. **Iterate** — model sees results, refines approach, writes more code
-5. **FINAL()** — model signals completion with final answer
+```bash
+cd ~/src/hermes-rlm
+~/.hermes/hermes-agent/venv/bin/python test_v2.py "your query"
 
-The context is a Python **variable**, not a prompt. The model accesses it programmatically — no token limit applies to the context itself.
-
-## Works with default compressor
-
-**Key insight:** the built-in compressor summarizes in-memory messages, but ALL original messages are persisted to state.db **before** compression happens. The flush loop writes each message to state.db as it's produced. When compression fires, the originals are already archived.
-
+# Options:
+#   --scope current|all   (default: current — session lineage only)
+#   --limit N             (default: 500 messages)
+#   --session ID          (default: auto-detect latest)
 ```
-Turn 1-50: messages flushed to state.db (originals preserved)
-Compress:  in-memory messages → summary + tail
-Turn 51+:  new messages flushed to state.db
-rlm_search: loads ALL messages from session lineage → original context restored
-```
-
-Session lineage (`parent_session_id` chains) connects compressed sessions. rlm_search walks the chain and loads everything.
-
-## Two layers (Mode 2 only)
-
-| Layer | Trigger | Speed | How |
-|-------|---------|-------|-----|
-| `pre_llm_call` hook | Every turn | ~1-3s | Loads context → single sub-query → inject |
-| `rlm_search` tool | Agent-initiated | ~10-30s | Full REPL with model agency |
-
-## Dependencies
-
-- `repl.py` — adapted from [rlm-minimal](https://github.com/alexzhang13/rlm)
-- Uses `call_llm(task="rlm")` for sub-queries — routes through `auxiliary.rlm` config (falls back to auto-detection if not configured)
-- Reads state.db via Hermes's `SessionDB`
 
 ## Files
 
 ```
 __init__.py      # exports RLMContextEngine
 plugin.yaml      # metadata
-engine.py        # both modes: context engine + regular plugin tool
-repl.py          # REPL sandbox (adapted from rlm-minimal)
-README.md        # this file
+engine.py        # context engine + regular plugin tool dispatch
+repl.py          # REPL sandbox, prompts, code execution
+test_v2.py       # test harness
+v1/              # archived v1 (flat context string, pre-JSON)
 ```
+
+## Dependencies
+
+- `call_llm(task="rlm")` for sub-queries — routes through `auxiliary.rlm` config
+- Reads state.db via Hermes's `SessionDB` (FTS5 full-text search)
+- No external dependencies beyond what Hermes already provides
