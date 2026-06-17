@@ -469,22 +469,7 @@ def run_rlm_repl(
         content = content.strip()
         _log(f"model response ({len(content)} chars):\n{content[:2000]}")
 
-        # Check for FINAL answer
-        final = find_final_answer(content)
-        if final:
-            _log(f"FINAL detected — type={final[0]}, content={final[1][:500]}")
-            answer_type, answer_content = final
-            if answer_type == 'FINAL':
-                return answer_content
-            elif answer_type == 'FINAL_VAR':
-                var_name = answer_content.strip().strip('"').strip("'")
-                if var_name in env.locals:
-                    return str(env.locals[var_name])
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": f"Variable '{var_name}' not found. Use FINAL(answer) instead."})
-                continue
-
-        # Execute code blocks
+        # Execute code blocks FIRST (before FINAL check)
         code_blocks = find_code_blocks(content)
         if code_blocks:
             _log(f"found {len(code_blocks)} code block(s)")
@@ -507,7 +492,27 @@ def run_rlm_repl(
                     "role": "user",
                     "content": f"Code executed:\n```python\n{code}\n```\n\nOutput:\n{output}",
                 })
-        else:
+            # Code was executed — skip FINAL check this iteration.
+            # The model wrote FINAL before seeing execution results.
+            # It will write a real FINAL after seeing the output.
+            continue
+
+        # Check for FINAL answer (only when no code was executed)
+        final = find_final_answer(content)
+        if final:
+            _log(f"FINAL detected — type={final[0]}, content={final[1][:500]}")
+            answer_type, answer_content = final
+            if answer_type == 'FINAL':
+                return answer_content
+            elif answer_type == 'FINAL_VAR':
+                var_name = answer_content.strip().strip('"').strip("'")
+                if var_name in env.locals:
+                    return str(env.locals[var_name])
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": f"Variable '{var_name}' not found. Use FINAL(answer) instead."})
+                continue
+
+        if not code_blocks and not final:
             _log("no code blocks — model reasoning only")
             messages.append({"role": "assistant", "content": content})
 
