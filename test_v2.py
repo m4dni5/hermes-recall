@@ -68,15 +68,29 @@ def main():
     parser = argparse.ArgumentParser(description="RLM v2 test harness")
     parser.add_argument("query", nargs="?", default="What is the agent's self-chosen name and what does it mean?",
                        help="Query to run against the REPL")
-    parser.add_argument("--scope", default="all", choices=["all", "current"])
+    parser.add_argument("--scope", default="current", choices=["all", "current"])
     parser.add_argument("--limit", type=int, default=500)
-    parser.add_argument("--session", default=None, help="Session ID for scope=current")
+    parser.add_argument("--session", default=None, help="Session ID for scope=current (defaults to latest)")
     parser.add_argument("--hermes-home", default=None)
     args = parser.parse_args()
 
     # Default hermes home
     if not args.hermes_home:
         args.hermes_home = os.path.expanduser("~/.hermes/profiles/rbw")
+
+    # Auto-detect latest session if not specified
+    if not args.session and args.scope == "current":
+        from hermes_state import SessionDB
+        from pathlib import Path
+        db = SessionDB(Path(args.hermes_home) / "state.db")
+        try:
+            rows = db._conn.execute(
+                "SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1"
+            ).fetchall()
+            if rows:
+                args.session = rows[0]["id"]
+        except Exception:
+            pass
 
     print(f"=== RLM v2 Test Harness ===")
     print(f"Hermes home: {args.hermes_home}")
@@ -96,6 +110,9 @@ def main():
     total_chars = sum(len(m.get("content", "")) for m in messages_json)
     sessions = set(m.get("sid", "") for m in messages_json)
     print(f"Loaded: {len(messages_json)} messages, {total_chars} chars, {len(sessions)} sessions")
+    if args.session:
+        print(f"Session: {args.session}")
+    print(f"Sessions in scope: {sorted(sessions)}")
 
     # Step 2: Simulate pre_llm_call hook — FTS5 on the query
     print("\n--- FTS5 pre-search (simulating pre_llm_call hook) ---")
@@ -124,13 +141,16 @@ def main():
         print(f"FTS5 pre-search failed: {e}")
 
     # Step 3: Run the REPL
+    # Build session_ids list for search_context scoping
+    session_ids_for_repl = list(sessions) if args.scope == "current" else None
+
     print("\n--- Running REPL ---")
     from repl import run_rlm_repl
     answer = run_rlm_repl(
         messages_json=messages_json,
         query=args.query,
         hermes_home=args.hermes_home,
-        session_ids=None,
+        session_ids=session_ids_for_repl,
         fts_hints=fts_hints,
     )
     print()
