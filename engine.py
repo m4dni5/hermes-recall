@@ -144,6 +144,36 @@ def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
 # Tool implementation (shared by both modes)
 # ---------------------------------------------------------------------------
 
+def _fts_hits_to_indices(fts_hits: list, messages_json: List[dict]) -> List[int]:
+    """Convert FTS5 search results to indices into the messages_json array.
+
+    Matches by session_id + role + content prefix (first 100 chars).
+    """
+    if not fts_hits or not messages_json:
+        return []
+    # Build lookup: (session_id, role, content_prefix) -> index
+    lookup = {}
+    for i, msg in enumerate(messages_json):
+        key = (msg.get("sid", ""), msg.get("role", ""), msg.get("content", "")[:100])
+        lookup[key] = i
+
+    indices = []
+    for hit in fts_hits:
+        sid = hit.get("session_id", "")
+        role = hit.get("role", "")
+        content = hit.get("content", "")[:100]
+        key = (sid, role, content)
+        if key in lookup:
+            indices.append(lookup[key])
+        else:
+            # Fallback: match by session_id + role only
+            for i, msg in enumerate(messages_json):
+                if msg.get("sid") == sid and msg.get("role") == role:
+                    indices.append(i)
+                    break
+    return sorted(set(indices))
+
+
 RLM_SEARCH_SCHEMA = {
     "name": "rlm_search",
     "description": (
@@ -179,6 +209,7 @@ def execute_rlm_search(
     scope: str = "current",
     session_id: str = "",
     hermes_home: Optional[Path] = None,
+    cached_fts_hits: Optional[list] = None,
 ) -> str:
     """Execute rlm_search — shared by both context engine and regular plugin."""
     if not query.strip():
@@ -223,6 +254,11 @@ def execute_rlm_search(
     # Run the RLM REPL
     sys.path.insert(0, str(Path(__file__).parent))
 
+    # Convert cached FTS5 hits to JSON indices
+    fts_hints = None
+    if cached_fts_hits:
+        fts_hints = _fts_hits_to_indices(cached_fts_hits, messages_json)
+
     from repl import run_rlm_repl
     try:
         answer = run_rlm_repl(
@@ -230,6 +266,7 @@ def execute_rlm_search(
             query=query,
             hermes_home=str(hermes_home) if hermes_home else None,
             session_ids=lineage if lineage else None,
+            fts_hints=fts_hints,
         )
     except Exception as exc:
         logger.warning("RLM REPL failed, falling back to direct aux model: %s", exc)
@@ -274,6 +311,10 @@ class RLMContextEngine(ContextEngine):
         self._session_id: str = ""
         self._hermes_home: Optional[Path] = None
         self.model = self.base_url = self.api_key = self.provider = self.api_mode = ""
+        self._hook_registered = False
+        # Cached FTS5 hits from pre_llm_call — passed to rlm_search REPL
+        self._cached_hits: Optional[List[int]] = None
+        self._cached_query: str = ""
 
     def update_from_response(self, usage):
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
@@ -336,6 +377,52 @@ class RLMContextEngine(ContextEngine):
         self._session_id = session_id
         hm = kwargs.get("hermes_home")
         self._hermes_home = Path(hm) if hm else None
+        self._ensure_hook_registered()
+
+    def _ensure_hook_registered(self):
+        if self._hook_registered:
+            return
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            get_plugin_manager()._hooks.setdefault("pre_llm_call", []).append(self._on_pre_llm_call)
+            self._hook_registered = True
+            logger.info("RLM: registered pre_llm_call hook")
+        except Exception as exc:
+            logger.debug("RLM: hook registration failed: %s", exc)
+
+    def _on_pre_llm_call(self, session_id, user_message, conversation_history, **kwargs):
+        """Lightweight FTS5 scan on every turn. Metadata only — no LLM call.
+
+        Injects a one-line note into the context telling the agent how many
+        archived messages match the current prompt. Caches the hit indices
+        so rlm_search's REPL can skip the search step.
+        """
+        db = _get_session_db(self._hermes_home)
+        if db is None:
+            return None
+        try:
+            results = db.search_messages(user_message, limit=10)
+            if not results:
+                return None
+
+            # Cache the FTS5 hits for the REPL
+            # We can't compute JSON indices here (no messages_json loaded yet),
+            # but we cache the session+role keys so the REPL can match them.
+            self._cached_hits = results
+            self._cached_query = user_message
+
+            count = len(results)
+            preview = results[0].get("snippet", results[0].get("content", ""))[:100]
+            return {
+                "context": (
+                    f"[RLM] {count} archived messages match this topic. "
+                    f"Preview: \"{preview}\". "
+                    f"Call rlm_search(query=\"...\") to access full context."
+                )
+            }
+        except Exception as exc:
+            logger.debug("RLM pre_llm_call failed: %s", exc)
+        return None
 
     def update_model(self, model, context_length, base_url="", api_key="",
                      provider="", api_mode="", **kw):
@@ -350,12 +437,17 @@ class RLMContextEngine(ContextEngine):
     def handle_tool_call(self, name, args, **kwargs):
         if name != "rlm_search":
             return json.dumps({"error": f"Unknown RLM tool: {name}"})
-        return execute_rlm_search(
+        result = execute_rlm_search(
             query=args.get("query", ""),
             scope=args.get("scope", "current"),
             session_id=self._session_id,
             hermes_home=self._hermes_home,
+            cached_fts_hits=self._cached_hits,
         )
+        # Clear cache after use
+        self._cached_hits = None
+        self._cached_query = ""
+        return result
 
     def get_status(self):
         status = super().get_status()

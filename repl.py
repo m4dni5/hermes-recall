@@ -319,6 +319,7 @@ Each message is a dict: {{"i": index, "sid": "session_id", "role": "user"|"assis
 Sample of the first few messages:
 {preview}
 
+{search_hints}
 The REPL environment has:
 1. A `messages` variable — a JSON array of all archived messages. Query it with list comprehensions, filters, etc.
 2. A `search_context(query, limit=10)` function — FTS5 full-text search that returns JSON array of message indices. Use this FIRST to find relevant messages quickly, then read full content from `messages[idx]`.
@@ -358,12 +359,14 @@ def build_system_prompt(
     session_count: int = 0,
     total_chars: int = 0,
     preview: str = "",
+    search_hints: str = "",
 ) -> List[Dict[str, str]]:
     content = REPL_SYSTEM_PROMPT.format(
         message_count=message_count,
         session_count=session_count,
         total_chars=total_chars,
         preview=preview,
+        search_hints=search_hints,
     )
     return [{"role": "system", "content": content}]
 
@@ -395,6 +398,7 @@ def run_rlm_repl(
     max_llm_tokens: int = 2048,
     hermes_home: Optional[str] = None,
     session_ids: Optional[List[str]] = None,
+    fts_hints: Optional[List[int]] = None,
 ) -> str:
     """Run the RLM REPL loop over a JSON messages array.
 
@@ -425,6 +429,20 @@ def run_rlm_repl(
         preview_lines.append(f'[session:{sid} role:{role}] {content}')
     preview = "\n".join(preview_lines) if preview_lines else "(empty)"
 
+    # Build search hints from pre-computed FTS5 hits
+    search_hints = ""
+    if fts_hints:
+        hint_previews = []
+        for idx in fts_hints[:5]:
+            if idx < len(messages_json):
+                msg = messages_json[idx]
+                hint_previews.append(f"  messages[{idx}] ({msg['role']}): {msg['content'][:150]}...")
+        search_hints = (
+            f"PRE-SEARCH RESULTS: FTS5 found {len(fts_hints)} relevant messages at indices {fts_hints}. "
+            f"Start by reading these messages directly — no need to call search_context() first.\n"
+            + "\n".join(hint_previews) + "\n"
+        )
+
     env = REPLEnv(
         messages_json=messages_json,
         max_llm_tokens=max_llm_tokens,
@@ -436,6 +454,7 @@ def run_rlm_repl(
         session_count=session_count,
         total_chars=total_chars,
         preview=preview,
+        search_hints=search_hints,
     )
 
     _log(f"starting loop — {len(messages_json)} messages, {total_chars} chars, {session_count} sessions")

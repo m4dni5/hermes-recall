@@ -95,16 +95,42 @@ def main():
     total_chars = sum(len(m.get("content", "")) for m in messages_json)
     sessions = set(m.get("sid", "") for m in messages_json)
     print(f"Loaded: {len(messages_json)} messages, {total_chars} chars, {len(sessions)} sessions")
-    print()
 
-    # Step 2: Run the REPL
-    print("--- Running REPL ---")
+    # Step 2: Simulate pre_llm_call hook — FTS5 on the query
+    print("\n--- FTS5 pre-search (simulating pre_llm_call hook) ---")
+    fts_hints = None
+    try:
+        from hermes_state import SessionDB
+        from pathlib import Path
+        db = SessionDB(Path(args.hermes_home) / "state.db")
+        results = db.search_messages(args.query, limit=10)
+        if results:
+            # Convert to indices
+            lookup = {}
+            for i, msg in enumerate(messages_json):
+                key = (msg.get("sid", ""), msg.get("role", ""), msg.get("content", "")[:100])
+                lookup[key] = i
+            fts_hints = []
+            for hit in results:
+                key = (hit.get("session_id", ""), hit.get("role", ""), hit.get("content", "")[:100])
+                if key in lookup:
+                    fts_hints.append(lookup[key])
+            fts_hints = sorted(set(fts_hints))
+            print(f"FTS5 found {len(results)} results → {len(fts_hints)} message indices: {fts_hints}")
+        else:
+            print("FTS5 found no results")
+    except Exception as e:
+        print(f"FTS5 pre-search failed: {e}")
+
+    # Step 3: Run the REPL
+    print("\n--- Running REPL ---")
     from repl import run_rlm_repl
     answer = run_rlm_repl(
         messages_json=messages_json,
         query=args.query,
         hermes_home=args.hermes_home,
         session_ids=None,
+        fts_hints=fts_hints,
     )
     print()
     print("=== ANSWER ===")
