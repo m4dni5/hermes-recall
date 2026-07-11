@@ -1,12 +1,10 @@
 """Unit tests for RLM engine — parsing, schema, imports."""
 
-import json
-
 import pytest
 
 
 def test_schema_valid():
-    from engine import RLM_SEARCH_SCHEMA
+    from schemas import RLM_SEARCH_SCHEMA
 
     assert RLM_SEARCH_SCHEMA["name"] == "rlm_search"
     assert "query" in RLM_SEARCH_SCHEMA["parameters"]["properties"]
@@ -27,7 +25,7 @@ def test_schema_valid():
     ],
 )
 def test_parse_tool_call(text, expected_tool, expected_args):
-    from engine import _parse_tool_call
+    from loop import _parse_tool_call
 
     result = _parse_tool_call(text)
     assert result is not None
@@ -36,7 +34,7 @@ def test_parse_tool_call(text, expected_tool, expected_args):
 
 
 def test_parse_tool_call_no_match():
-    from engine import _parse_tool_call
+    from loop import _parse_tool_call
 
     assert _parse_tool_call("just some text") is None
     assert _parse_tool_call("") is None
@@ -52,13 +50,13 @@ def test_parse_tool_call_no_match():
     ],
 )
 def test_find_final(text, expected):
-    from engine import _find_final
+    from loop import _find_final
 
     assert _find_final(text) == expected
 
 
 def test_find_final_no_match():
-    from engine import _find_final
+    from loop import _find_final
 
     assert _find_final("no final here") is None
     assert _find_final("") is None
@@ -66,21 +64,18 @@ def test_find_final_no_match():
 
 def test_imports():
     """Verify all key imports resolve."""
-    from engine import (
-        RLM_SEARCH_SCHEMA,
-        _find_final,
-        _parse_tool_call,
-        execute_rlm_search,
-        register,
-        run_sub_model_loop,
-    )
+    from schemas import RLM_SEARCH_SCHEMA
+    from loop import run_sub_model_loop, _parse_tool_call, _find_final
+    from tools import execute_rlm_search, register
+
     assert callable(run_sub_model_loop)
     assert callable(execute_rlm_search)
     assert callable(register)
+    assert RLM_SEARCH_SCHEMA["name"] == "rlm_search"
 
 
 def test_build_system_prompt():
-    from engine import _build_system_prompt
+    from loop import _build_system_prompt
 
     msgs = _build_system_prompt("test query")
     assert len(msgs) == 1
@@ -90,7 +85,7 @@ def test_build_system_prompt():
 
 
 def test_build_user_prompt():
-    from engine import _build_user_prompt
+    from loop import _build_user_prompt
 
     msg = _build_user_prompt("test", iteration=0)
     assert msg["role"] == "user"

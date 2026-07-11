@@ -75,7 +75,7 @@ def main():
     print(f"Query: {args.query}")
     print()
 
-    from engine import run_sub_model_loop
+    from loop import run_sub_model_loop
 
     answer = run_sub_model_loop(
         query=args.query,

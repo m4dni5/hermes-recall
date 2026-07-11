@@ -77,10 +77,13 @@ uses — discovery, scroll, and browse.
 ```
 __init__.py      # exports register()
 plugin.yaml      # metadata
-engine.py        # sub-model loop, tool registration
+schemas.py       # RLM_SEARCH_SCHEMA
+loop.py          # sub-model loop, parsing, prompts
+tools.py         # session DB access, plugin registration
 pyproject.toml   # package metadata
 tests/
   test_rlm.py    # test harness
+  test_engine.py # unit tests
 ```
 
 ## Dependencies
