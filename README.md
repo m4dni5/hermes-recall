@@ -25,8 +25,14 @@ searches, not the scrolling, not the synthesis reasoning.
 ## Install
 
 ```bash
-ln -s ~/src/hermes-rlm ~/.hermes/plugins/rlm
+hermes plugins install m4dni5/hermes-rlm
 # Restart Hermes
+```
+
+Or for local dev:
+
+```bash
+ln -s ~/src/hermes-rlm ~/.hermes/plugins/rlm
 ```
 
 No config changes needed. The plugin registers as a regular tool and uses
@@ -80,7 +86,7 @@ plugin.yaml      # metadata
 schemas.py       # RLM_SEARCH_SCHEMA
 loop.py          # sub-model loop, parsing, prompts
 tools.py         # session DB access, plugin registration
-pyproject.toml   # package metadata
+pyproject.toml   # pytest config
 tests/
   test_rlm.py    # test harness
   test_engine.py # unit tests
