@@ -4,6 +4,9 @@ Registers rlm_search as a regular plugin tool. The sub-model uses
 Hermes's built-in session_search to explore past conversations.
 """
 
-from .engine import register  # noqa: F401
+try:
+    from .engine import register  # noqa: F401
+except ImportError:
+    from engine import register  # noqa: F401
 
 __all__ = ["register"]
