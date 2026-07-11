@@ -69,8 +69,8 @@ rlm_search(query)
        └─ return {answer, method: "rlm"}
 ```
 
-The sub-model gets exactly the same `session_search` interface the main agent
-uses — discovery, scroll, browse. No code execution, no JSON archives, no REPL.
+The sub-model gets the same `session_search` interface the main agent
+uses — discovery, scroll, and browse.
 
 ## Files
 

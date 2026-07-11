@@ -5,8 +5,7 @@ Single tool: rlm_search(query). The sub-model iterates:
   session_search(session_id, around_message_id) → scroll deeper
   FINAL(answer)                             → return synthesized answer
 
-No REPL sandbox, no code execution, no JSON archive. The sub-model uses
-Hermes's built-in session_search as its only tool.
+The sub-model uses Hermes's built-in session_search as its only tool.
 """
 
 import json
@@ -86,7 +85,7 @@ FINAL(your complete answer here — can span multiple sentences, be thorough)
 
 RULES:
 - Write ONLY one JSON tool call OR one FINAL per response — never both
-- Do NOT write code, do NOT write Python, do NOT use ```repl``` blocks
+- Do NOT write code, do NOT write Python, do NOT use code blocks
 - The only tool you have is session_search — do not invent other tools
 - If your first search returns nothing useful, try different keywords
 - Answer the question directly and completely in your FINAL"""
