@@ -1,10 +1,9 @@
-"""RLM plugin — search archived conversation context via RLM retrieval.
+"""RLM plugin — encapsulated session search via sub-model reasoning loop.
 
-Two modes:
-- Regular plugin: exposes rlm_search tool alongside default compressor
-- Context engine: replaces compressor (set context.engine: rlm in config)
+Registers rlm_search as a regular plugin tool. The sub-model uses
+Hermes's built-in session_search to explore past conversations.
 """
 
-from .engine import RLMContextEngine, register  # noqa: F401
+from .engine import register  # noqa: F401
 
-__all__ = ["RLMContextEngine", "register"]
+__all__ = ["register"]

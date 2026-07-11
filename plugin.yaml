@@ -1,5 +1,5 @@
 name: rlm
-description: "RLM retrieval — search archived conversation context via REPL-based deep dives"
-version: 0.2.0
+description: "Encapsulated session search — sub-model reasoning loop over past conversations"
+version: 0.3.0
 author: matt
 license: MIT

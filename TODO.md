@@ -1,54 +1,31 @@
 # TODO
 
-## Test harness: load a benign session
+## Test with real session data
 
-The test harness currently loads session lineage, which during development
-is polluted with test output about the test itself. This creates recursive
-noise — the model searches for "Caido FUZZ" and finds previous test runs
-searching for "Caido FUZZ", not the actual feature.
+The test harness works against live state.db which is polluted with test
+runs. Add a curated test fixture — a small JSON file with known messages —
+so tests are deterministic.
 
-**Fix:** add a `--session` option that loads a specific session by ID, and
-add a curated test session with known content (e.g., the original "Read
-Before Write" naming conversation from `20260528_120855_d2cf7a`). The test
-harness should load that session's messages, not the latest session which is
-always the current test.
+## Error format from sub-model
 
-Alternatively: snapshot a small, clean set of messages as a JSON fixture
-file (no state.db dependency for CI).
+The sub-model prompt says "output JSON tool calls" but some models resist
+structured output. Monitor how different models (DeepSeek V4, MiMo, GPT-4.1)
+handle the format and adjust parsing accordingly.
 
-## Convergence: reduce unnecessary iterations
+## Iteration efficiency
 
-The model often runs 7-12 iterations when 3-4 would suffice. It scans
-messages manually instead of trusting `llm_query()` to extract from the
-first hit. The system prompt could be more aggressive about "search once,
-analyze the results, FINAL."
+The sub-model loop has max 8 iterations. For simple queries, the model
+should converge in 2-3. Monitor whether the prompt is aggressive enough
+about "search once, analyze, answer."
 
-## FTS5 phrase matching
+## Session lineage filtering
 
-FTS5 on "Iain M. Banks" returns 0 results because the exact phrase doesn't
-match. "Culture Minds" returns 42 hits. Consider adding trigram/substring
-fallback, or teaching the model to break phrases into keywords for
-`search_context()`.
+Currently `session_search` is called with `current_session_id` for the
+active session's lineage. Verify this correctly excludes the current
+conversation from results (avoiding self-referential noise).
 
-## JSON archive growth
+## Fallback path
 
-Each compression event appends to the JSON archive. After many sessions,
-the archive could grow large. Need a pruning/rotation strategy — cap at N
-messages or N MB, oldest first.
-
-## Model-agnostic prompting
-
-DeepSeek V4 Flash writes ` ` ` python ` ` ` or XML tool calls instead of
-` ` ` repl ` ` ` blocks. MiMo v2.5 Pro follows instructions more faithfully.
-The prompt currently has a "write ` ` ` repl ` ` ` blocks" rule but some
-models ignore it. Options:
-- Detect and handle ` ` ` python ` ` ` blocks (already tried, leads to
-  more format variants)
-- Accept any code fence (tried, too permissive)
-- Stronger prompt guidance (current approach — works with some models)
-- Runtime hint in the system prompt about the expected model
-
-## Remove v1/ archive directory
-
-The `v1/` directory is a snapshot of the pre-JSON implementation. Keep it
-for reference during development, remove before a stable release.
+The fallback calls session_search directly + aux model synthesis. Test
+this path by forcing a sub-model loop failure and verifying the fallback
+produces useful answers.

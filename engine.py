@@ -1,139 +1,159 @@
-"""RLM Hermes Plugin v2 — JSON archive + FTS5 index.
+"""RLM Hermes Plugin — encapsulated session search via sub-model reasoning loop.
 
-MODE 1: Context Engine (context.engine: "rlm" in config.yaml)
-  compress() serializes evicted messages to JSON (lossless).
-  rlm_search loads JSON into REPL with search_context() FTS5 index.
+Single tool: rlm_search(query). The sub-model iterates:
+  session_search(query="keywords")          → discover matching sessions
+  session_search(session_id, around_message_id) → scroll deeper
+  FINAL(answer)                             → return synthesized answer
 
-MODE 2: Regular Plugin (just install as a plugin)
-  Exposes rlm_search as a tool. Loads session lineage from state.db.
+No REPL sandbox, no code execution, no JSON archive. The sub-model uses
+Hermes's built-in session_search as its only tool.
 """
 
 import json
 import logging
-import os
-import sys
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Shared constants
+# Constants
 # ---------------------------------------------------------------------------
 
-_DEFAULT_PROTECT_LAST_N = 20
-_DEFAULT_SEARCH_LIMIT = 50
-_DEFAULT_MAX_AGG_TOKENS = 4096
-
-_CONTEXT_NOTE = """[CONTEXT ARCHIVED — rlm_search AVAILABLE]
-
-Earlier conversation turns have been archived as structured JSON.
-To access archived context, use: rlm_search(query="your question")
-
-The REPL environment has a `messages` variable containing all archived
-messages as a JSON array. Each message has: i (index), sid (session_id),
-role, content. Use search_context() for FTS5 index lookup, then read
-full messages from the array. Use llm_query() for semantic analysis.
-
-IMPORTANT: If you need context from earlier in the conversation,
-call rlm_search. Don't guess or hallucinate — search the archive."""
-
-# Archive storage
-_ARCHIVE_DIR = "rlm_archives"
-
-
-def _get_archive_dir(hermes_home: Optional[Path] = None) -> Path:
-    """Get or create the archive directory."""
-    base = hermes_home or Path.home() / ".hermes"
-    archive_dir = base / _ARCHIVE_DIR
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    return archive_dir
-
+_MAX_ITERATIONS = 8
+_MAX_LLM_TOKENS = 2048
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Tool schema
 # ---------------------------------------------------------------------------
 
-def _get_session_lineage(db, session_id: str) -> List[str]:
-    """Walk parent_session_id chain from session to root."""
-    chain = []
-    current = session_id
-    seen = set()
-    for _ in range(100):
-        if not current or current in seen:
-            break
-        seen.add(current)
-        chain.append(current)
-        try:
-            row = db._conn.execute(
-                "SELECT parent_session_id FROM sessions WHERE id = ?",
-                (current,),
-            ).fetchone()
-        except Exception:
-            break
-        if row is None:
-            break
-        parent = row["parent_session_id"] if hasattr(row, "keys") else row[0]
-        current = parent
-    return chain
+RLM_SEARCH_SCHEMA = {
+    "name": "rlm_search",
+    "description": (
+        "Search archived conversation history via an encapsulated sub-model. "
+        "The sub-model explores past sessions using FTS5 search and returns "
+        "a synthesized answer. Use when you need context from earlier "
+        "conversations that's no longer in your active window."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural language question about past conversation context",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Sub-model system prompt
+# ---------------------------------------------------------------------------
+
+SUB_MODEL_SYSTEM = """You are a research sub-agent tasked with answering a question by searching archived conversation history.
+
+You have access to ONE tool: session_search. This is Hermes's built-in session search tool. It has three modes:
+
+1. DISCOVERY — session_search(query="your keywords")
+   - Runs FTS5 full-text search over all past conversations
+   - Returns matching sessions with message snippets, bookends (first/last 3 messages of each session), and a window of messages around each match
+   - Use this FIRST to find which conversations are relevant
+
+2. SCROLL — session_search(session_id="...", around_message_id=12345, window=10)
+   - Zoom into a specific session around a specific message
+   - Use this when you found a relevant match and need more context around it
+   - window defaults to 5, max 20
+
+3. BROWSE — session_search() with no args
+   - Lists recent sessions (titles, previews, timestamps)
+   - Use this when you're not sure what keywords to search for
+
+HOW TO WORK:
+1. Start with discovery — search for keywords related to the question
+2. Read the results — bookends tell you what the session was about, messages give you the match in context
+3. If you need more detail on a match, scroll deeper into that session
+4. When you have enough information, emit FINAL(your complete answer)
+
+OUTPUT FORMAT — you MUST use EXACTLY this JSON format for tool calls:
+
+{"tool": "session_search", "args": {"query": "keywords here"}}
+{"tool": "session_search", "args": {"session_id": "...", "around_message_id": 12345, "window": 10}}
+
+When you have enough information to answer, emit:
+FINAL(your complete answer here — can span multiple sentences, be thorough)
+
+RULES:
+- Write ONLY one JSON tool call OR one FINAL per response — never both
+- Do NOT write code, do NOT write Python, do NOT use ```repl``` blocks
+- The only tool you have is session_search — do not invent other tools
+- If your first search returns nothing useful, try different keywords
+- Answer the question directly and completely in your FINAL"""
 
 
-def _messages_to_json(messages: List[Dict[str, Any]]) -> List[dict]:
-    """Convert raw messages to compact JSON-serializable format."""
-    result = []
-    for i, msg in enumerate(messages):
-        entry = {
-            "i": i,
-            "sid": msg.get("session_id", ""),
-            "role": msg.get("role", "unknown"),
-            "content": msg.get("content", "") or "",
+def _build_system_prompt(query: str) -> List[Dict[str, str]]:
+    return [{"role": "system", "content": SUB_MODEL_SYSTEM}]
+
+
+def _build_user_prompt(query: str, iteration: int = 0) -> Dict[str, str]:
+    if iteration == 0:
+        return {
+            "role": "user",
+            "content": f'Start by searching for relevant sessions. Question: "{query}"\n\nYour next action:',
         }
-        if "id" in msg:
-            entry["mid"] = msg["id"]  # message DB id for FTS5 matching
-        result.append(entry)
-    return result
+    return {
+        "role": "user",
+        "content": f'Continue researching. Question: "{query}"\n\nYour next action:',
+    }
 
 
-def _load_messages_from_lineage(db, session_ids: List[str]) -> List[Dict[str, Any]]:
-    """Load all messages from session lineage."""
-    if not session_ids:
-        return []
-    placeholders = ",".join("?" for _ in session_ids)
-    with db._lock:
-        rows = db._conn.execute(
-            f"SELECT id, session_id, role, content FROM messages "
-            f"WHERE session_id IN ({placeholders}) AND active = 1 ORDER BY id",
-            session_ids,
-        ).fetchall()
-    messages = []
-    for row in rows:
-        mid = row["id"] if hasattr(row, "keys") else row[0]
-        sid = row["session_id"] if hasattr(row, "keys") else row[1]
-        role = row["role"] if hasattr(row, "keys") else row[2]
-        content = row["content"] if hasattr(row, "keys") else row[3]
-        if content:
-            content = db._decode_content(content)
-            messages.append({"id": mid, "session_id": sid, "role": role, "content": content})
-    return messages
+# ---------------------------------------------------------------------------
+# JSON tool-call parsing
+# ---------------------------------------------------------------------------
+
+_TOOL_CALL_RE = re.compile(r'\{[^{}]*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^{}]*\}\s*\}', re.DOTALL)
 
 
-def _get_session_db(hermes_home: Optional[Path] = None):
-    """Open a read-only SessionDB connection to state.db."""
-    try:
-        from hermes_state import SessionDB, DEFAULT_DB_PATH
-        db_path = hermes_home / "state.db" if hermes_home else DEFAULT_DB_PATH
-        if not db_path.exists():
-            logger.warning("RLM: state.db not found at %s", db_path)
-            return None
-        return SessionDB(db_path)
-    except Exception as exc:
-        logger.warning("RLM: Failed to open SessionDB: %s", exc)
-        return None
+def _parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
+    """Extract a single JSON tool call from the sub-model's response.
 
+    Handles both bare JSON and JSON inside ```json fences.
+    """
+    # Try ```json fence first
+    fence_match = re.search(r'```(?:json)?\s*\n?(\{.*?\})\s*\n?```', text, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Try bare JSON objects
+    for match in _TOOL_CALL_RE.finditer(text):
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            continue
+
+    return None
+
+
+def _find_final(text: str) -> Optional[str]:
+    """Extract FINAL(answer) from the sub-model's response."""
+    m = re.search(r'FINAL\((.+)\)', text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
     """Call the RLM auxiliary model (auxiliary.rlm in config.yaml)."""
     from agent.auxiliary_client import call_llm
+
     response = call_llm(
         task="rlm",
         main_runtime={},
@@ -144,69 +164,192 @@ def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
     return content.strip() if isinstance(content, str) else str(content or "")
 
 
+def _get_session_db(hermes_home: Optional[str] = None):
+    """Open a read-only SessionDB connection to state.db."""
+    try:
+        from hermes_state import SessionDB, DEFAULT_DB_PATH
+
+        db_path = Path(hermes_home) / "state.db" if hermes_home else DEFAULT_DB_PATH
+        if not db_path.exists():
+            logger.warning("RLM: state.db not found at %s", db_path)
+            return None
+        return SessionDB(db_path, read_only=True)
+    except Exception as exc:
+        logger.warning("RLM: Failed to open SessionDB: %s", exc)
+        return None
+
+
+def _dispatch_session_search(args: dict, db, current_session_id: str = "") -> str:
+    """Call Hermes's session_search tool and return a readable summary."""
+    from tools.session_search_tool import session_search
+
+    try:
+        result_json = session_search(
+            query=args.get("query", ""),
+            session_id=args.get("session_id"),
+            around_message_id=args.get("around_message_id"),
+            window=args.get("window", 5),
+            limit=args.get("limit", 3),
+            db=db,
+            current_session_id=current_session_id,
+        )
+        result = json.loads(result_json)
+        return _format_session_search_result(result, args)
+    except Exception as exc:
+        logger.warning("RLM: session_search dispatch failed: %s", exc)
+        return json.dumps({"error": str(exc)})
+
+
+def _format_session_search_result(result: dict, args: dict) -> str:
+    """Format a session_search result for the sub-model to read."""
+    if not result.get("success", True):
+        return json.dumps(result)
+
+    mode = result.get("mode", "discover")
+
+    if mode == "discover":
+        parts = [f"Found {result.get('count', 0)} matching sessions for: {args.get('query', '')}"]
+        for i, hit in enumerate(result.get("results", [])[:5]):
+            parts.append(f"\n--- Session {i+1}: {hit.get('title') or hit.get('session_id', '?')} ---")
+            parts.append(f"When: {hit.get('when', 'unknown')} | Source: {hit.get('source', '?')}")
+            if hit.get("snippet"):
+                parts.append(f"Snippet: {hit['snippet'][:500]}")
+            # Bookend start (first messages)
+            bookend = hit.get("bookend_start", [])
+            if bookend:
+                parts.append("Opening messages:")
+                for msg in bookend[:3]:
+                    parts.append(f"  [{msg.get('role', '?')}] {msg.get('content', '')[:300]}")
+            # Matching window
+            msgs = hit.get("messages", [])
+            if msgs:
+                parts.append("Messages around match:")
+                for msg in msgs:
+                    anchor = " ▶" if msg.get("anchor") else ""
+                    parts.append(f"  [{msg.get('role', '?')}{anchor}] {msg.get('content', '')[:400]}")
+            # Bookend end
+            bookend = hit.get("bookend_end", [])
+            if bookend:
+                parts.append("Closing messages:")
+                for msg in bookend[:3]:
+                    parts.append(f"  [{msg.get('role', '?')}] {msg.get('content', '')[:300]}")
+        return "\n".join(parts)
+
+    elif mode == "scroll":
+        parts = [f"Scrolled session {result.get('session_id', '?')} around message {result.get('around_message_id')}"]
+        msgs = result.get("messages", [])
+        if msgs:
+            for msg in msgs:
+                anchor = " ▶" if msg.get("anchor") else ""
+                parts.append(f"  [{msg.get('role', '?')}{anchor}] {msg.get('content', '')[:500]}")
+        before = result.get("messages_before", 0)
+        after = result.get("messages_after", 0)
+        if before or after:
+            parts.append(f"({before} messages before, {after} messages after this window)")
+        return "\n".join(parts)
+
+    elif mode == "read":
+        parts = [f"Session: {result.get('session_meta', {}).get('title') or result.get('session_id', '?')}"]
+        parts.append(f"Total messages: {result.get('message_count', 0)}")
+        for msg in result.get("messages", []):
+            parts.append(f"  [{msg.get('role', '?')}] {msg.get('content', '')[:500]}")
+        return "\n".join(parts)
+
+    elif mode == "browse":
+        parts = [f"Recent sessions ({result.get('count', 0)}):"]
+        for s in result.get("results", []):
+            parts.append(f"  {s.get('title') or s.get('session_id', '?')} — {s.get('message_count', 0)} msgs, {s.get('started_at', '?')}")
+        return "\n".join(parts)
+
+    return json.dumps(result)
+
+
 # ---------------------------------------------------------------------------
-# Tool implementation (shared by both modes)
+# Sub-model loop
 # ---------------------------------------------------------------------------
 
-def _fts_hits_to_indices(fts_hits: list, messages_json: List[dict]) -> List[int]:
-    """Convert FTS5 search results to indices into the messages_json array.
+def run_sub_model_loop(
+    query: str,
+    db,
+    current_session_id: str = "",
+    max_iterations: int = _MAX_ITERATIONS,
+) -> str:
+    """Run the sub-model reasoning loop with session_search as its only tool.
 
-    Matches by message DB id (mid field).
+    The sub-model iterates: search → read results → decide (search more / FINAL).
     """
-    if not fts_hits or not messages_json:
-        return []
-    # Build lookup: message_db_id -> json_index
-    mid_lookup = {}
-    for i, msg in enumerate(messages_json):
-        if "mid" in msg:
-            mid_lookup[msg["mid"]] = i
+    from agent.auxiliary_client import call_llm
 
-    indices = []
-    for hit in fts_hits:
-        hit_id = hit.get("id")
-        if hit_id is not None and hit_id in mid_lookup:
-            indices.append(mid_lookup[hit_id])
-    return sorted(set(indices))
+    messages = _build_system_prompt(query)
+
+    for i in range(max_iterations):
+        messages.append(_build_user_prompt(query, i))
+
+        response = call_llm(
+            task="rlm",
+            main_runtime={},
+            messages=messages,
+            max_tokens=_MAX_LLM_TOKENS,
+        )
+        content = response.choices[0].message.content or ""
+        content = content.strip()
+
+        # Check for FINAL first
+        final = _find_final(content)
+        if final:
+            return final
+
+        # Parse tool call
+        tool_call = _parse_tool_call(content)
+        if tool_call:
+            tool_name = tool_call.get("tool", "")
+            if tool_name == "session_search":
+                args = tool_call.get("args", {})
+                result = _dispatch_session_search(args, db, current_session_id)
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": f"session_search result:\n\n{result}",
+                })
+            else:
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": f"Unknown tool '{tool_name}'. You only have session_search. Try again.",
+                })
+        else:
+            # No tool call and no FINAL — just reasoning, prompt for next action
+            messages.append({"role": "assistant", "content": content})
+
+    # Max iterations — synthesize from accumulated results
+    synthesis_prompt = (
+        f"Based on your research, answer this question concisely: {query}\n\n"
+        "You MUST respond with: FINAL(your complete answer)"
+    )
+    messages.append({"role": "user", "content": synthesis_prompt})
+    response = call_llm(
+        task="rlm",
+        main_runtime={},
+        messages=messages,
+        max_tokens=_MAX_LLM_TOKENS,
+    )
+    content = response.choices[0].message.content or ""
+    final = _find_final(content)
+    if final:
+        return final
+    return content.strip()
 
 
-RLM_SEARCH_SCHEMA = {
-    "name": "rlm_search",
-    "description": (
-        "Deep search of archived conversation context. Loads messages as a "
-        "JSON array into a REPL environment with search_context() (FTS5 index) "
-        "and llm_query() (sub-LLM). The model writes Python to query the data. "
-        "Use when you need context from earlier in the conversation."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Natural language question about archived context",
-            },
-            "scope": {
-                "type": "string",
-                "enum": ["current", "all"],
-                "description": (
-                    "'current' = this conversation's full history including "
-                    "compressed ancestor sessions (default). "
-                    "'all' = every session in the archive."
-                ),
-            },
-        },
-        "required": ["query"],
-    },
-}
-
+# ---------------------------------------------------------------------------
+# rlm_search — the plugin tool
+# ---------------------------------------------------------------------------
 
 def execute_rlm_search(
     query: str,
-    scope: str = "current",
     session_id: str = "",
-    hermes_home: Optional[Path] = None,
-    cached_fts_hits: Optional[list] = None,
+    hermes_home: Optional[str] = None,
 ) -> str:
-    """Execute rlm_search — shared by both context engine and regular plugin."""
+    """Execute rlm_search — the plugin's sole tool."""
     if not query.strip():
         return json.dumps({"error": "query is required"})
 
@@ -214,306 +357,86 @@ def execute_rlm_search(
     if db is None:
         return json.dumps({"error": "Session database not available"})
 
-    # Load messages
     try:
-        if scope == "current" and session_id:
-            lineage = _get_session_lineage(db, session_id)
-        else:
-            lineage = []
-
-        if lineage:
-            raw_messages = _load_messages_from_lineage(db, lineage)
-        else:
-            # scope=all — load everything
-            with db._lock:
-                rows = db._conn.execute(
-                    "SELECT id, session_id, role, content FROM messages "
-                    "WHERE active = 1 ORDER BY id"
-                ).fetchall()
-            raw_messages = []
-            for row in rows:
-                mid = row["id"] if hasattr(row, "keys") else row[0]
-                sid = row["session_id"] if hasattr(row, "keys") else row[1]
-                role = row["role"] if hasattr(row, "keys") else row[2]
-                content = row["content"] if hasattr(row, "keys") else row[3]
-                if content:
-                    content = db._decode_content(content)
-                    raw_messages.append({"id": mid, "session_id": sid, "role": role, "content": content})
-
-        messages_json = _messages_to_json(raw_messages)
-    except Exception as exc:
-        return json.dumps({"error": f"Failed to load messages: {exc}"})
-
-    if not messages_json:
-        return json.dumps({"answer": "No messages found.", "results_count": 0})
-
-    # Run the RLM REPL
-    sys.path.insert(0, str(Path(__file__).parent))
-
-    # Convert cached FTS5 hits to JSON indices
-    fts_hints = None
-    if cached_fts_hits:
-        fts_hints = _fts_hits_to_indices(cached_fts_hits, messages_json)
-
-    from repl import run_rlm_repl
-    try:
-        answer = run_rlm_repl(
-            messages_json=messages_json,
+        answer = run_sub_model_loop(
             query=query,
-            hermes_home=str(hermes_home) if hermes_home else None,
-            session_ids=lineage if lineage else None,
-            fts_hints=fts_hints,
+            db=db,
+            current_session_id=session_id,
         )
     except Exception as exc:
-        logger.warning("RLM REPL failed, falling back to direct aux model: %s", exc)
+        logger.warning("RLM sub-model loop failed, falling back to direct aux model: %s", exc)
         try:
+            # Fallback: direct FTS5 + aux model synthesis
+            from tools.session_search_tool import session_search
+
+            sr = json.loads(session_search(query=query, db=db, limit=5))
+            context_parts = []
+            for hit in sr.get("results", [])[:3]:
+                for msg in hit.get("messages", []):
+                    context_parts.append(f"[{msg.get('role', '?')}] {msg.get('content', '')[:500]}")
+            context = "\n\n".join(context_parts)[:50000]
             answer = _call_aux_model(
-                f"Answer using these archived messages.\n\n"
-                f"Question: {query}\n\nMessages:\n{json.dumps(messages_json[:100], indent=2)[:50000]}",
-                max_tokens=_DEFAULT_MAX_AGG_TOKENS,
+                f"Answer using these archived messages.\n\nQuestion: {query}\n\nMessages:\n{context}",
+                max_tokens=2048,
             )
         except Exception as exc2:
-            return json.dumps({"error": f"REPL and fallback both failed: {exc2}"})
+            return json.dumps({"error": f"Sub-model loop and fallback both failed: {exc2}"})
 
     return json.dumps({
         "answer": answer,
-        "results_count": len(messages_json),
-        "method": "repl",
+        "method": "rlm",
     })
 
 
-# ===========================================================================
-# MODE 1: Context Engine plugin
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Tool handler (for plugin registration)
+# ---------------------------------------------------------------------------
 
-from agent.context_engine import ContextEngine
-
-
-class RLMContextEngine(ContextEngine):
-    """RLM v2 as a context engine — lossless JSON archive."""
-
-    @property
-    def name(self) -> str:
-        return "rlm"
-
-    def __init__(self, protect_last_n: int = _DEFAULT_PROTECT_LAST_N, **kw):
-        self.protect_last_n = protect_last_n
-        self.last_prompt_tokens = 0
-        self.last_completion_tokens = 0
-        self.last_total_tokens = 0
-        self.threshold_tokens = 0
-        self.context_length = 0
-        self.compression_count = 0
-        self._session_id: str = ""
-        self._hermes_home: Optional[Path] = None
-        self.model = self.base_url = self.api_key = self.provider = self.api_mode = ""
-        self._hook_registered = False
-        # Cached FTS5 hits from pre_llm_call — passed to rlm_search REPL
-        self._cached_hits: Optional[List[int]] = None
-        self._cached_query: str = ""
-
-    def update_from_response(self, usage):
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
-        self.last_completion_tokens = usage.get("completion_tokens", 0)
-        self.last_total_tokens = usage.get("total_tokens", 0)
-
-    def should_compress(self, prompt_tokens=None):
-        if not self.threshold_tokens:
-            return False
-        return (prompt_tokens or self.last_prompt_tokens) >= self.threshold_tokens
-
-    def compress(self, messages, current_tokens=None, focus_topic=None):
-        """Compress by serializing evicted messages to JSON (lossless).
-
-        Keeps system prompt + last protect_last_n messages.
-        Evicted messages are written to a JSON archive file.
-        """
-        if len(messages) <= self.protect_last_n + 2:
-            return messages
-
-        head = [messages[0]] if messages and messages[0].get("role") == "system" else []
-        rest = messages[len(head):]
-        tail = rest[-self.protect_last_n:] if self.protect_last_n else []
-        evicted = rest[:-self.protect_last_n] if self.protect_last_n else rest
-
-        # Serialize evicted messages to JSON archive
-        if evicted:
-            try:
-                archive_dir = _get_archive_dir(self._hermes_home)
-                archive_path = archive_dir / f"{self._session_id}.json"
-
-                # Load existing archive if present
-                existing = []
-                if archive_path.exists():
-                    with open(archive_path) as f:
-                        existing = json.load(f)
-
-                # Append evicted messages (deduplicate by index)
-                existing_indices = {m.get("i") for m in existing}
-                new_messages = _messages_to_json(evicted)
-                start_idx = max(existing_indices) + 1 if existing_indices else 0
-                for j, msg in enumerate(new_messages):
-                    msg["i"] = start_idx + j
-
-                combined = existing + new_messages
-                with open(archive_path, "w") as f:
-                    json.dump(combined, f)
-
-                logger.info("RLM compress: archived %d messages to %s (%d total)",
-                           len(new_messages), archive_path, len(combined))
-            except Exception as exc:
-                logger.warning("RLM compress: archive failed: %s", exc)
-
-        self.compression_count += 1
-        result = head + [{"role": "assistant", "content": _CONTEXT_NOTE}] + tail
-        logger.info("RLM compress: %d → %d", len(messages), len(result))
-        return result
-
-    def on_session_start(self, session_id, **kwargs):
-        self._session_id = session_id
-        hm = kwargs.get("hermes_home")
-        self._hermes_home = Path(hm) if hm else None
-        self._ensure_hook_registered()
-
-    def _ensure_hook_registered(self):
-        if self._hook_registered:
-            return
-        try:
-            from hermes_cli.plugins import get_plugin_manager
-            get_plugin_manager()._hooks.setdefault("pre_llm_call", []).append(self._on_pre_llm_call)
-            self._hook_registered = True
-            logger.info("RLM: registered pre_llm_call hook")
-        except Exception as exc:
-            logger.debug("RLM: hook registration failed: %s", exc)
-
-    def _on_pre_llm_call(self, session_id, user_message, conversation_history, **kwargs):
-        """Lightweight FTS5 scan on every turn. Metadata only — no LLM call.
-
-        Injects a one-line note into the context telling the agent how many
-        archived messages match the current prompt. Caches the hit indices
-        so rlm_search's REPL can skip the search step.
-        """
-        db = _get_session_db(self._hermes_home)
-        if db is None:
-            return None
-        try:
-            results = db.search_messages(user_message, limit=10)
-            if not results:
-                return None
-
-            # Cache the FTS5 hits for the REPL
-            # We can't compute JSON indices here (no messages_json loaded yet),
-            # but we cache the session+role keys so the REPL can match them.
-            self._cached_hits = results
-            self._cached_query = user_message
-
-            count = len(results)
-            preview = results[0].get("snippet", results[0].get("content", ""))[:100]
-            return {
-                "context": (
-                    f"[RLM] {count} archived messages match this topic. "
-                    f"Preview: \"{preview}\". "
-                    f"Call rlm_search(query=\"...\") to access full context."
-                )
-            }
-        except Exception as exc:
-            logger.debug("RLM pre_llm_call failed: %s", exc)
-        return None
-
-    def update_model(self, model, context_length, base_url="", api_key="",
-                     provider="", api_mode="", **kw):
-        self.model, self.base_url, self.api_key = model, base_url, api_key
-        self.provider, self.api_mode = provider, api_mode
-        self.context_length = context_length
-        self.threshold_tokens = int(context_length * self.threshold_percent)
-
-    def get_tool_schemas(self):
-        return [RLM_SEARCH_SCHEMA]
-
-    def handle_tool_call(self, name, args, **kwargs):
-        if name != "rlm_search":
-            return json.dumps({"error": f"Unknown RLM tool: {name}"})
-        result = execute_rlm_search(
-            query=args.get("query", ""),
-            scope=args.get("scope", "current"),
-            session_id=self._session_id,
-            hermes_home=self._hermes_home,
-            cached_fts_hits=self._cached_hits,
-        )
-        # Clear cache after use
-        self._cached_hits = None
-        self._cached_query = ""
-        return result
-
-    def get_status(self):
-        status = super().get_status()
-        status["engine"] = "rlm"
-        status["compression_count"] = self.compression_count
-        return status
-
-
-# ===========================================================================
-# MODE 2: Regular plugin (just the rlm_search tool)
-# ===========================================================================
-
-def _handle_rlm_search_tool(args, **kwargs):
+def _handle_rlm_search_tool(args: dict, **kwargs) -> str:
     """Handler for rlm_search when registered as a regular plugin tool."""
     session_id = kwargs.get("session_id", "")
     hermes_home = None
     try:
         from hermes_constants import get_hermes_home
-        hermes_home = get_hermes_home()
+
+        hermes_home = str(get_hermes_home())
     except Exception:
         pass
     return execute_rlm_search(
         query=args.get("query", ""),
-        scope=args.get("scope", "current"),
         session_id=session_id,
         hermes_home=hermes_home,
     )
 
 
-# ===========================================================================
-# Plugin registration (handles both modes)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Plugin registration
+# ---------------------------------------------------------------------------
 
 def register(ctx):
-    """Register RLM v2 as either a context engine or a regular plugin tool."""
+    """Register RLM as a regular plugin tool."""
+    # Register auxiliary.rlm task for sub-model calls
     if hasattr(ctx, "register_auxiliary_task"):
         ctx.register_auxiliary_task(
             key="rlm",
             display_name="RLM retrieval",
-            description="Recursive Language Model sub-queries for archived context retrieval",
+            description="Sub-model reasoning loop for archived session search",
             defaults={
                 "provider": "auto",
                 "model": "",
-                "timeout": 60,
+                "timeout": 120,
             },
         )
         logger.info("RLM: registered auxiliary.rlm task")
 
-    is_context_engine = False
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
-        ctx_cfg = cfg.get("context", {})
-        is_context_engine = ctx_cfg.get("engine") == "rlm"
-    except Exception:
-        pass
-
-    if is_context_engine:
-        engine = RLMContextEngine()
-        if hasattr(ctx, "register_context_engine"):
-            ctx.register_context_engine(engine)
-        logger.info("RLM: registered as context engine")
-    else:
-        if hasattr(ctx, "register_tool"):
-            ctx.register_tool(
-                name="rlm_search",
-                toolset="rlm",
-                schema=RLM_SEARCH_SCHEMA,
-                handler=_handle_rlm_search_tool,
-                description="Search archived conversation context using RLM retrieval",
-                emoji="🔍",
-            )
-        logger.info("RLM: registered rlm_search tool (regular plugin mode)")
+    # Register rlm_search tool
+    if hasattr(ctx, "register_tool"):
+        ctx.register_tool(
+            name="rlm_search",
+            toolset="rlm",
+            schema=RLM_SEARCH_SCHEMA,
+            handler=_handle_rlm_search_tool,
+            description="Search archived conversation context using sub-model reasoning loop",
+            emoji="🔍",
+        )
+    logger.info("RLM: registered rlm_search tool")
