@@ -91,9 +91,3 @@ tests/
   test_rlm.py    # test harness
   test_engine.py # unit tests
 ```
-
-## Dependencies
-
-- `call_llm(task="rlm")` for sub-model calls — routes through `auxiliary.rlm`
-- `tools.session_search_tool` — Hermes's built-in session search
-- `hermes_state.SessionDB` — SQLite session store with FTS5
