@@ -9,6 +9,7 @@ So now this plugin just encapsulates what your Hermes Agent will usually do if y
 It was a fun experiment!
 
 Enjoy
+
 Matt
 
 ## What it does
