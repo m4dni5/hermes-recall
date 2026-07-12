@@ -3,3 +3,5 @@ description: "Sub-model reasoning loop over past conversations — search, explo
 version: 0.3.0
 author: matt
 license: MIT
+provides_tools:
+  - recall

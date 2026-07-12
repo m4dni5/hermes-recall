@@ -5,8 +5,8 @@ Hermes's built-in session_search to explore past conversations.
 """
 
 try:
-    from .tools import register  # noqa: F401
+    from .recall_tools import register  # noqa: F401
 except ImportError:
-    from tools import register  # noqa: F401
+    from recall_tools import register  # noqa: F401
 
 __all__ = ["register"]

@@ -1,183 +1,233 @@
-"""Sub-model reasoning loop — iterates session_search calls until FINAL(answer).
+"""Sub-model reasoning loop — native tool calling over session_search.
 
-The sub-model gets session_search as its only tool. It discovers matching
-sessions, scrolls into specific messages, and synthesizes an answer.
+The sub-model gets session_search as a native function-calling tool via
+``call_llm(tools=[...])``. The model decides when to search, the loop
+dispatches the call and feeds the result back, and the model either
+searches again or returns a text answer. No regex parsing, no FINAL
+convention — the OpenAI tool-calling protocol handles structured
+communication between the model and the loop.
+
+Termination: the model returns a response without tool_calls → that text
+is the answer. If max iterations is reached first, a final call without
+tools forces a text synthesis.
 """
 
+from __future__ import annotations
+
 import json
-import re
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 _MAX_ITERATIONS = 8
 _MAX_LLM_TOKENS = 2048
 
-# ---------------------------------------------------------------------------
-# Sub-model system prompt
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Module-level imports with fallback for test environments.
+#
+# In production (package mode), ``from .tools import _dispatch_session_search``
+# resolves within the plugin package. In test mode (bare modules on
+# pythonpath=["."]), the relative import fails and the fallback
+# ``from tools import _dispatch_session_search`` picks up the plugin's own
+# tools.py. ``call_llm`` is patched in tests; the try/except keeps the
+# module importable when the framework isn't on the path.
+# --------------------------------------------------------------------------- #
 
-SUB_MODEL_SYSTEM = """You are a research sub-agent tasked with answering a question by searching archived conversation history.
+try:
+    from agent.auxiliary_client import call_llm  # type: ignore[import]
+except ImportError:
+    call_llm = None  # type: ignore[assignment]
 
-You have access to ONE tool: session_search. This is Hermes's built-in session search tool. It has three modes:
-
-1. DISCOVERY — session_search(query="your keywords")
-   - Runs FTS5 full-text search over all past conversations
-   - Returns matching sessions with message snippets, bookends (first/last 3 messages of each session), and a window of messages around each match
-   - Use this FIRST to find which conversations are relevant
-
-2. SCROLL — session_search(session_id="...", around_message_id=12345, window=10)
-   - Zoom into a specific session around a specific message
-   - Use this when you found a relevant match and need more context around it
-   - window defaults to 5, max 20
-
-3. BROWSE — session_search() with no args
-   - Lists recent sessions (titles, previews, timestamps)
-   - Use this when you're not sure what keywords to search for
-
-HOW TO WORK:
-1. Start with discovery — search for keywords related to the question
-2. Read the results — bookends tell you what the session was about, messages give you the match in context
-3. If you need more detail on a match, scroll deeper into that session
-4. When you have enough information, emit FINAL(your complete answer)
-
-OUTPUT FORMAT — you MUST use EXACTLY this JSON format for tool calls:
-
-{"tool": "session_search", "args": {"query": "keywords here"}}
-{"tool": "session_search", "args": {"session_id": "...", "around_message_id": 12345, "window": 10}}
-
-When you have enough information to answer, emit:
-FINAL(your complete answer here — can span multiple sentences, be thorough)
-
-RULES:
-- Write ONLY one JSON tool call OR one FINAL per response — never both
-- Do NOT write code, do NOT write Python, do NOT use code blocks
-- The only tool you have is session_search — do not invent other tools
-- If your first search returns nothing useful, try different keywords
-- Answer the question directly and completely in your FINAL"""
+try:
+    from .recall_tools import _dispatch_session_search  # type: ignore[import]
+except ImportError:
+    try:
+        from recall_tools import _dispatch_session_search  # type: ignore[import,no-redef]
+    except ImportError:
+        _dispatch_session_search = None  # type: ignore[assignment]
 
 
-def _build_system_prompt(query: str) -> List[Dict[str, str]]:
-    return [{"role": "system", "content": SUB_MODEL_SYSTEM}]
+# --------------------------------------------------------------------------- #
+# Tool schema — what the sub-model sees via native function calling.
+# --------------------------------------------------------------------------- #
+
+SESSION_SEARCH_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "session_search",
+        "description": (
+            "Search archived conversation history. Three modes: "
+            "(1) pass query for FTS5 keyword search — returns matching "
+            "sessions with snippets and message windows; (2) pass "
+            "session_id + around_message_id to scroll into a specific "
+            "session around a message; (3) pass nothing to browse recent "
+            "sessions. Use discovery first, then scroll for detail."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keywords to search for across all past conversations.",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Session ID to scroll into (from a discovery result).",
+                },
+                "around_message_id": {
+                    "type": "integer",
+                    "description": "Message ID to center the scroll window on.",
+                },
+                "window": {
+                    "type": "integer",
+                    "description": "Messages on each side of anchor (1-20). Default 5.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Sessions to return from discovery (1-10). Default 3.",
+                },
+            },
+        },
+    },
+}
 
 
-def _build_user_prompt(query: str, iteration: int = 0) -> Dict[str, str]:
-    if iteration == 0:
-        return {
-            "role": "user",
-            "content": f'Start by searching for relevant sessions. Question: "{query}"\n\nYour next action:',
-        }
-    return {
-        "role": "user",
-        "content": f'Continue researching. Question: "{query}"\n\nYour next action:',
-    }
+# --------------------------------------------------------------------------- #
+# System prompt
+# --------------------------------------------------------------------------- #
 
-
-# ---------------------------------------------------------------------------
-# JSON tool-call parsing
-# ---------------------------------------------------------------------------
-
-_TOOL_CALL_RE = re.compile(
-    r'\{[^{}]*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^{}]*\}\s*\}', re.DOTALL
+SUB_MODEL_SYSTEM = (
+    "You are a research sub-agent tasked with answering a question by "
+    "searching archived conversation history.\n\n"
+    "You have one tool: session_search. It searches past conversations.\n\n"
+    "How to work:\n"
+    "1. Start with discovery — search for keywords related to the question\n"
+    "2. Read the results — bookends tell you what the session was about, "
+    "messages give you the match in context\n"
+    "3. If you need more detail, scroll deeper into a matching session "
+    "using session_id + around_message_id\n"
+    "4. When you have enough information, respond with your answer as "
+    "plain text (no tool call)\n\n"
+    "If your first search returns nothing useful, try different keywords. "
+    "Answer the question directly and completely."
 )
 
 
-def _parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
-    """Extract a single JSON tool call from the sub-model's response.
-
-    Handles both bare JSON and JSON inside ```json fences.
-    """
-    fence_match = re.search(r"```(?:json)?\s*\n?(\{.*?\})\s*\n?```", text, re.DOTALL)
-    if fence_match:
-        try:
-            return json.loads(fence_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    for match in _TOOL_CALL_RE.finditer(text):
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            continue
-
-    return None
+def _build_messages(query: str) -> list[dict[str, Any]]:
+    """Build the initial message list: system prompt + user query."""
+    return [
+        {"role": "system", "content": SUB_MODEL_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                "Answer this question using archived conversation "
+                f"history: {query}"
+            ),
+        },
+    ]
 
 
-def _find_final(text: str) -> Optional[str]:
-    """Extract FINAL(answer) from the sub-model's response."""
-    m = re.search(r"FINAL\((.+)\)", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    return None
-
-
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # The loop
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 
 def run_sub_model_loop(
     query: str,
-    db,
+    db: Any,
     current_session_id: str = "",
     max_iterations: int = _MAX_ITERATIONS,
 ) -> str:
-    """Run the sub-model reasoning loop with session_search as its only tool.
+    """Run the sub-model reasoning loop with session_search as a native tool.
 
-    The sub-model iterates: search → read results → decide (search more / FINAL).
+    The sub-model iterates: search → read results → decide (search more /
+    answer). The loop terminates when the model returns text without a
+    tool call, or when max iterations is reached (at which point we prompt
+    for synthesis without tools, forcing a text answer).
+
     The ``db`` parameter is a hermes_state.SessionDB instance.
     """
-    from .tools import _dispatch_session_search
+    messages = _build_messages(query)
 
-    from agent.auxiliary_client import call_llm
-
-    messages = _build_system_prompt(query)
-
-    for i in range(max_iterations):
-        messages.append(_build_user_prompt(query, i))
-
+    for _ in range(max_iterations):
         response = call_llm(
             task="recall",
             main_runtime={},
             messages=messages,
+            tools=[SESSION_SEARCH_TOOL],
             max_tokens=_MAX_LLM_TOKENS,
         )
-        content = response.choices[0].message.content or ""
-        content = content.strip()
+        msg = response.choices[0].message
+        content = (msg.content or "").strip()
 
-        final = _find_final(content)
-        if final:
-            return final
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            # Append the assistant message (with tool_calls) so the model
+            # sees its own request in context. The OpenAI API requires the
+            # assistant message to carry the tool_calls it made, and each
+            # tool result to reference the matching tool_call_id.
+            messages.append({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
 
-        tool_call = _parse_tool_call(content)
-        if tool_call:
-            tool_name = tool_call.get("tool", "")
-            if tool_name == "session_search":
-                args = tool_call.get("args", {})
-                result = _dispatch_session_search(args, db, current_session_id)
-                messages.append({"role": "assistant", "content": content})
+            for tc in tool_calls:
+                tool_name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+
+                if tool_name == "session_search":
+                    result = _dispatch_session_search(
+                        args, db, current_session_id)
+                else:
+                    result = json.dumps({
+                        "error": (
+                            f"Unknown tool '{tool_name}'. "
+                            "You only have session_search."
+                        ),
+                    })
+
                 messages.append({
-                    "role": "user",
-                    "content": f"session_search result:\n\n{result}",
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
                 })
-            else:
-                messages.append({"role": "assistant", "content": content})
-                messages.append({
-                    "role": "user",
-                    "content": f"Unknown tool '{tool_name}'. You only have session_search. Try again.",
-                })
-        else:
-            messages.append({"role": "assistant", "content": content})
+            continue
 
-    # Max iterations — synthesize
-    synthesis = (
-        f"Based on your research, answer this question concisely: {query}\n\n"
-        "You MUST respond with: FINAL(your complete answer)"
+        # No tool calls — the text response IS the answer.
+        return content
+
+    # Max iterations reached — prompt for synthesis without tools so
+    # the model must return text.
+    logger.info(
+        "recall: sub-model reached max_iterations (%d), synthesizing",
+        max_iterations,
     )
-    messages.append({"role": "user", "content": synthesis})
+    messages.append({
+        "role": "user",
+        "content": (
+            "You've reached the search limit. Answer the question "
+            f"concisely based on what you've found: {query}"
+        ),
+    })
     response = call_llm(
         task="recall",
         main_runtime={},
         messages=messages,
         max_tokens=_MAX_LLM_TOKENS,
     )
-    content = response.choices[0].message.content or ""
-    final = _find_final(content)
-    return final if final else content.strip()
+    msg = response.choices[0].message
+    return (msg.content or "").strip()

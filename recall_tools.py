@@ -23,7 +23,15 @@ def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
 
 
 def _get_session_db(hermes_home: Optional[str] = None):
-    """Open a read-only SessionDB connection to state.db."""
+    """Open a read-only SessionDB connection to state.db.
+
+    SessionDB with read_only=True skips _init_schema() entirely (it
+    returns early to avoid taking a write lock), which means
+    ``_fts_enabled`` stays ``False`` and all FTS5 searches silently
+    return zero results. We probe for the FTS5 table after opening and
+    set the flag manually — the table exists if a read-write SessionDB
+    ever opened this DB (i.e. Hermes has run at least once).
+    """
     try:
         from hermes_state import SessionDB, DEFAULT_DB_PATH
 
@@ -31,18 +39,44 @@ def _get_session_db(hermes_home: Optional[str] = None):
         if not db_path.exists():
             logger.warning("recall: state.db not found at %s", db_path)
             return None
-        return SessionDB(db_path, read_only=True)
+        db = SessionDB(db_path, read_only=True)
+        # SessionDB(read_only=True) skips _init_schema(), leaving
+        # _fts_enabled=False. Probe the FTS5 table and flip the flag
+        # so search_messages() doesn't short-circuit to [].
+        conn = getattr(db, "_conn", None)
+        if conn is not None and not db._fts_enabled:
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='messages_fts'"
+                ).fetchone()
+                if row:
+                    db._fts_enabled = True
+                    tri = conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='messages_fts_trigram'"
+                    ).fetchone()
+                    db._trigram_available = tri is not None
+            except Exception:
+                pass
+        return db
     except Exception as exc:
         logger.warning("recall: Failed to open SessionDB: %s", exc)
         return None
 
 
 def _dispatch_session_search(args: dict, db, current_session_id: str = "") -> str:
-    """Call Hermes's session_search tool and return a readable summary."""
+    """Call Hermes's session_search tool and return the raw JSON result.
+
+    The sub-agent uses native tool calling — it handles structured JSON
+    natively, so no formatting layer is needed. The raw result includes
+    tool_calls, snippets, bookends, anchors, and every field the session
+    DB exposes.
+    """
     from tools.session_search_tool import session_search
 
     try:
-        result_json = session_search(
+        return session_search(
             query=args.get("query", ""),
             session_id=args.get("session_id"),
             around_message_id=args.get("around_message_id"),
@@ -51,80 +85,9 @@ def _dispatch_session_search(args: dict, db, current_session_id: str = "") -> st
             db=db,
             current_session_id=current_session_id,
         )
-        result = json.loads(result_json)
-        return _format_session_search_result(result, args)
     except Exception as exc:
         logger.warning("recall: session_search dispatch failed: %s", exc)
         return json.dumps({"error": str(exc)})
-
-
-def _format_session_search_result(result: dict, args: dict) -> str:
-    """Format a session_search result for the sub-model to read."""
-    if not result.get("success", True):
-        return json.dumps(result)
-
-    mode = result.get("mode", "discover")
-
-    if mode == "discover":
-        parts = [f"Found {result.get('count', 0)} matching sessions for: {args.get('query', '')}"]
-        for i, hit in enumerate(result.get("results", [])[:5]):
-            parts.append(f"\n--- Session {i+1}: {hit.get('title') or hit.get('session_id', '?')} ---")
-            parts.append(f"When: {hit.get('when', 'unknown')} | Source: {hit.get('source', '?')}")
-            if hit.get("snippet"):
-                parts.append(f"Snippet: {hit['snippet'][:500]}")
-            bookend = hit.get("bookend_start", [])
-            if bookend:
-                parts.append("Opening messages:")
-                for msg in bookend[:3]:
-                    parts.append(f"  [{msg.get('role', '?')}] {msg.get('content', '')[:300]}")
-            msgs = hit.get("messages", [])
-            if msgs:
-                parts.append("Messages around match:")
-                for msg in msgs:
-                    anchor = " ▶" if msg.get("anchor") else ""
-                    parts.append(f"  [{msg.get('role', '?')}{anchor}] {msg.get('content', '')[:400]}")
-            bookend = hit.get("bookend_end", [])
-            if bookend:
-                parts.append("Closing messages:")
-                for msg in bookend[:3]:
-                    parts.append(f"  [{msg.get('role', '?')}] {msg.get('content', '')[:300]}")
-        return "\n".join(parts)
-
-    elif mode == "scroll":
-        parts = [
-            f"Scrolled session {result.get('session_id', '?')} "
-            f"around message {result.get('around_message_id')}"
-        ]
-        msgs = result.get("messages", [])
-        if msgs:
-            for msg in msgs:
-                anchor = " ▶" if msg.get("anchor") else ""
-                parts.append(f"  [{msg.get('role', '?')}{anchor}] {msg.get('content', '')[:500]}")
-        before = result.get("messages_before", 0)
-        after = result.get("messages_after", 0)
-        if before or after:
-            parts.append(f"({before} messages before, {after} messages after this window)")
-        return "\n".join(parts)
-
-    elif mode == "read":
-        parts = [
-            f"Session: {result.get('session_meta', {}).get('title') or result.get('session_id', '?')}"
-        ]
-        parts.append(f"Total messages: {result.get('message_count', 0)}")
-        for msg in result.get("messages", []):
-            parts.append(f"  [{msg.get('role', '?')}] {msg.get('content', '')[:500]}")
-        return "\n".join(parts)
-
-    elif mode == "browse":
-        parts = [f"Recent sessions ({result.get('count', 0)}):"]
-        for s in result.get("results", []):
-            parts.append(
-                f"  {s.get('title') or s.get('session_id', '?')} — "
-                f"{s.get('message_count', 0)} msgs, {s.get('started_at', '?')}"
-            )
-        return "\n".join(parts)
-
-    return json.dumps(result)
 
 
 def execute_recall(
@@ -189,6 +152,16 @@ def _handle_recall_tool(args: dict, **kwargs) -> str:
     )
 
 
+def _recall_available() -> bool:
+    """Check if state.db exists so the tool can be hidden when it can't work."""
+    try:
+        from hermes_constants import get_hermes_home
+        from pathlib import Path
+        return (Path(get_hermes_home()) / "state.db").exists()
+    except Exception:
+        return False
+
+
 def register(ctx):
     """Register recall as a regular plugin tool."""
     from .schemas import RECALL_SCHEMA
@@ -208,6 +181,7 @@ def register(ctx):
             toolset="recall",
             schema=RECALL_SCHEMA,
             handler=_handle_recall_tool,
+            check_fn=_recall_available,
             description="Search past conversation history using sub-model reasoning loop",
             emoji="🧠",
         )

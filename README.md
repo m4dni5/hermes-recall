@@ -77,16 +77,16 @@ cd ~/src/hermes-recall
 ```
 recall(query)
   │
-  └─ sub-model loop (auxiliary.rlm)
+  └─ sub-model loop (auxiliary.recall)
        │  tool: session_search(query="...")
        │  tool: session_search(session_id=..., around_message_id=...)
-       │  term: FINAL(answer)
+       │  term: text response (no tool call = answer)
        │
        └─ return {answer, method: "recall"}
 ```
 
 The sub-model gets the same `session_search` interface the main agent
-uses — discovery, scroll, and browse.
+uses — discovery, scroll, and browse — via native function calling.
 
 ## Files
 
@@ -95,7 +95,7 @@ __init__.py      # exports register()
 plugin.yaml      # metadata
 schemas.py       # RECALL_SCHEMA
 loop.py          # sub-model loop, parsing, prompts
-tools.py         # session DB access, plugin registration
+recall_tools.py  # session DB access, plugin registration
 pyproject.toml   # pytest config
 tests/
   test_rlm.py    # test harness

@@ -4,7 +4,7 @@
 Exercises recall against real session history from state.db.
 
 Usage:
-    cd ~/src/hermes-rlm
+    cd ~/src/hermes-recall
     python3 tests/test_rlm.py "your query"
     python3 tests/test_rlm.py "your query" --session SESSION_ID
 
@@ -14,19 +14,26 @@ Options:
 """
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
 
-# Add plugin dir to path so engine imports work
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Add hermes-agent to sys.path FIRST so framework imports (hermes_state,
+# tools.session_search_tool) resolve before the plugin's flat modules.
+_HERMES_AGENT = str(Path.home() / ".hermes" / "hermes-agent")
+if _HERMES_AGENT not in sys.path:
+    sys.path.insert(0, _HERMES_AGENT)
 
-from hermes_state import SessionDB
+# Framework imports must resolve before the plugin dir goes on sys.path.
+from hermes_state import SessionDB  # noqa: E402
+
+# Now add the plugin dir so `from loop import ...` and
+# `from recall_tools import ...` work.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RLM test harness")
+    parser = argparse.ArgumentParser(description="Recall test harness")
     parser.add_argument(
         "query",
         nargs="?",
@@ -54,6 +61,15 @@ def main():
         sys.exit(1)
 
     db = SessionDB(db_path, read_only=True)
+    # SessionDB(read_only=True) skips _init_schema(), leaving
+    # _fts_enabled=False. Probe the FTS5 table manually.
+    if not db._fts_enabled:
+        row = db._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='messages_fts'"
+        ).fetchone()
+        if row:
+            db._fts_enabled = True
 
     # Auto-detect latest session if not specified
     session_id = args.session
