@@ -29,6 +29,9 @@ recall("how does Caido auth work?")
 → returned to main agent as a single answer
 ```
 
+The sub-model gets the same `session_search` interface the main agent
+uses — discovery, scroll, and browse — via native function calling.
+
 The main agent's context only sees the final answer — not the intermediate
 searches, not the scrolling, not the synthesis reasoning.
 
@@ -37,17 +40,7 @@ searches, not the scrolling, not the synthesis reasoning.
 ```bash
 hermes plugins install m4dni5/hermes-recall
 hermes plugins enable hermes-recall
-# Restart Hermes
 ```
-
-Or for local dev:
-
-```bash
-ln -s ~/src/hermes-recall ~/.hermes/plugins/recall
-```
-
-No config changes needed. The plugin registers as a regular tool and uses
-`auxiliary.recall` for sub-model calls, or falls back to the default model.
 
 ## Configuration (optional)
 
@@ -61,33 +54,6 @@ auxiliary:
     provider: "nous"
     timeout: 60
 ```
-
-## Test harness
-
-```bash
-cd ~/src/hermes-recall
-~/.hermes/hermes-agent/venv/bin/python tests/test_rlm.py "your query"
-
-# Options:
-#   --session ID     (default: auto-detect latest)
-#   --hermes-home    (default: ~/.hermes/profiles/rbw)
-```
-
-## Architecture
-
-```
-recall(query)
-  │
-  └─ sub-model loop (auxiliary.recall)
-       │  tool: session_search(query="...")
-       │  tool: session_search(session_id=..., around_message_id=...)
-       │  term: text response (no tool call = answer)
-       │
-       └─ return {answer, method: "recall"}
-```
-
-The sub-model gets the same `session_search` interface the main agent
-uses — discovery, scroll, and browse — via native function calling.
 
 ## Files
 
