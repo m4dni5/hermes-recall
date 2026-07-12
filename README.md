@@ -36,7 +36,7 @@ ln -s ~/src/hermes-recall ~/.hermes/plugins/recall
 ```
 
 No config changes needed. The plugin registers as a regular tool and uses
-`auxiliary.rlm` for sub-model calls (auto-configured).
+`auxiliary.recall` for sub-model calls (auto-configured).
 
 ## Configuration (optional)
 
@@ -45,7 +45,7 @@ Override the sub-model:
 ```yaml
 # ~/.hermes/config.yaml
 auxiliary:
-  rlm:
+  recall:
     model: "gpt-4.1-nano"
     provider: "openrouter"
     timeout: 120

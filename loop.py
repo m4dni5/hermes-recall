@@ -134,7 +134,7 @@ def run_sub_model_loop(
         messages.append(_build_user_prompt(query, i))
 
         response = call_llm(
-            task="rlm",
+            task="recall",
             main_runtime={},
             messages=messages,
             max_tokens=_MAX_LLM_TOKENS,
@@ -173,7 +173,7 @@ def run_sub_model_loop(
     )
     messages.append({"role": "user", "content": synthesis})
     response = call_llm(
-        task="rlm",
+        task="recall",
         main_runtime={},
         messages=messages,
         max_tokens=_MAX_LLM_TOKENS,

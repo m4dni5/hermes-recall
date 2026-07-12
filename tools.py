@@ -9,11 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
-    """Call the recall auxiliary model (auxiliary.rlm in config.yaml)."""
+    """Call the recall auxiliary model (auxiliary.recall in config.yaml)."""
     from agent.auxiliary_client import call_llm
 
     response = call_llm(
-        task="rlm",
+        task="recall",
         main_runtime={},
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
@@ -195,12 +195,12 @@ def register(ctx):
 
     if hasattr(ctx, "register_auxiliary_task"):
         ctx.register_auxiliary_task(
-            key="rlm",
+            key="recall",
             display_name="Recall retrieval",
             description="Sub-model reasoning loop for archived session search",
             defaults={"provider": "auto", "model": "", "timeout": 120},
         )
-        logger.info("recall: registered auxiliary.rlm task")
+        logger.info("recall: registered auxiliary.recall task")
 
     if hasattr(ctx, "register_tool"):
         ctx.register_tool(
