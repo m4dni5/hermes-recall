@@ -36,6 +36,7 @@ searches, not the scrolling, not the synthesis reasoning.
 
 ```bash
 hermes plugins install m4dni5/hermes-recall
+hermes plugins enable hermes-recall
 # Restart Hermes
 ```
 
