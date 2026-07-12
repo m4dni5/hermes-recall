@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
-_MAX_ITERATIONS = 4
+_MAX_ITERATIONS = 5
 _MAX_LLM_TOKENS = 2048
 
 # --------------------------------------------------------------------------- #
