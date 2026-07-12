@@ -16,12 +16,34 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
 _MAX_ITERATIONS = 5
 _MAX_LLM_TOKENS = 2048
+
+# Wall-clock budget for the entire loop. If exceeded, the loop stops
+# iterating and forces the synthesis path (same as max iterations).
+# With auxiliary.recall timeout=60s per call, 5 iterations could take
+# up to 300s. This cap ensures the loop never runs longer than 90s
+# regardless of per-call latency.
+_LOOP_TIMEOUT_S = 90
+
+# Cap on each tool result before it enters the sub-model's context.
+# session_search can return 14+ full messages per session × 3 sessions
+# in a single discovery call — if those messages contain terminal dumps
+# or file reads, a single result can be 50-100K chars. Across 8
+# iterations that blows the sub-model's context window.
+#
+# The main model's session_search results go through the framework's
+# 3-layer budget system (per-result persistence at 100K, per-turn
+# aggregate at 200K, see tools/tool_result_storage.py). The sub-model's
+# loop calls session_search() directly as a Python function, bypassing
+# that pipeline. This cap restores the per-result limit the framework
+# provides, scaled down for the sub-model's smaller context.
+_MAX_TOOL_RESULT_CHARS = 12_000
 
 # --------------------------------------------------------------------------- #
 # Module-level imports with fallback for test environments.
@@ -148,8 +170,13 @@ def run_sub_model_loop(
     The ``db`` parameter is a hermes_state.SessionDB instance.
     """
     messages = _build_messages(query)
+    started = time.monotonic()
 
     for _ in range(max_iterations):
+        # Wall-clock budget — bail to synthesis if exceeded.
+        if time.monotonic() - started > _LOOP_TIMEOUT_S:
+            logger.info("recall: loop timeout (%ds), synthesizing", _LOOP_TIMEOUT_S)
+            break
         response = call_llm(
             task="recall",
             main_runtime={},
@@ -200,6 +227,20 @@ def run_sub_model_loop(
                         ),
                     })
 
+                # Cap tool result size before it enters the sub-model's
+                # context. The main model's tool results go through the
+                # framework's budget system (tools/tool_result_storage.py)
+                # — the sub-model's loop bypasses it. Truncate at the
+                # character boundary, keeping valid JSON (the result is a
+                # JSON string, so cutting mid-string is fine — the model
+                # reads it as text, not as a parse target).
+                if len(result) > _MAX_TOOL_RESULT_CHARS:
+                    result = (
+                        result[:_MAX_TOOL_RESULT_CHARS]
+                        + '\n... (truncated — call session_search '
+                        'with a smaller limit or window for more)'
+                    )
+
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -210,11 +251,11 @@ def run_sub_model_loop(
         # No tool calls — the text response IS the answer.
         return content
 
-    # Max iterations reached — prompt for synthesis without tools so
-    # the model must return text.
+    # Max iterations or timeout — prompt for synthesis without tools
+    # so the model must return text.
     logger.info(
-        "recall: sub-model reached max_iterations (%d), synthesizing",
-        max_iterations,
+        "recall: sub-model reached limit (iterations=%d, timeout=%ds), synthesizing",
+        max_iterations, _LOOP_TIMEOUT_S,
     )
     messages.append({
         "role": "user",

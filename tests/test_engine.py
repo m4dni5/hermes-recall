@@ -182,6 +182,38 @@ def test_loop_max_iterations_synthesis():
     assert last_call.kwargs.get("tools") is None
 
 
+def test_loop_timeout_synthesis():
+    """Wall-clock timeout breaks the loop and forces synthesis."""
+    from loop import run_sub_model_loop
+
+    tool_response = _make_response(_make_msg(
+        content=None,
+        tool_calls=[{"name": "session_search", "args": {"query": "slow"}}],
+    ))
+    synthesis_response = _make_response(_make_msg(
+        content="Timed out answer."
+    ))
+    responses = [tool_response, synthesis_response]
+
+    def fake_dispatch(args, db, session_id):
+        return json.dumps({"success": True, "mode": "discover", "results": []})
+
+    # Patch time.monotonic: t=0 (start), t=1 (first deadline check,
+    # under timeout → iteration runs), t=100 (second deadline check,
+    # over timeout → break to synthesis).
+    with patch("loop.call_llm", side_effect=responses) as mock_llm, \
+         patch("loop._dispatch_session_search", side_effect=fake_dispatch), \
+         patch("loop.time.monotonic", side_effect=[0, 1, 100, 100, 100]):
+        result = run_sub_model_loop("test query", FakeDB(), max_iterations=10)
+
+    assert result == "Timed out answer."
+    # Only 1 tool-call round + 1 synthesis = 2 calls (timeout broke
+    # after the first iteration).
+    assert mock_llm.call_count == 2
+    last_call = mock_llm.call_args_list[-1]
+    assert last_call.kwargs.get("tools") is None
+
+
 def test_loop_unknown_tool_rejected():
     """Model calls a tool that isn't session_search — loop sends error back."""
     from loop import run_sub_model_loop
