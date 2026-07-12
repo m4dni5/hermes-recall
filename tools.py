@@ -1,4 +1,4 @@
-"""RLM tool plumbing — session DB access, aux model fallback, plugin registration."""
+"""Recall tool plumbing — session DB access, aux model fallback, plugin registration."""
 
 import json
 import logging
@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 def _call_aux_model(prompt: str, max_tokens: int = 1024) -> str:
-    """Call the RLM auxiliary model (auxiliary.rlm in config.yaml)."""
+    """Call the recall auxiliary model (auxiliary.rlm in config.yaml)."""
     from agent.auxiliary_client import call_llm
 
     response = call_llm(
@@ -29,11 +29,11 @@ def _get_session_db(hermes_home: Optional[str] = None):
 
         db_path = Path(hermes_home) / "state.db" if hermes_home else DEFAULT_DB_PATH
         if not db_path.exists():
-            logger.warning("RLM: state.db not found at %s", db_path)
+            logger.warning("recall: state.db not found at %s", db_path)
             return None
         return SessionDB(db_path, read_only=True)
     except Exception as exc:
-        logger.warning("RLM: Failed to open SessionDB: %s", exc)
+        logger.warning("recall: Failed to open SessionDB: %s", exc)
         return None
 
 
@@ -54,7 +54,7 @@ def _dispatch_session_search(args: dict, db, current_session_id: str = "") -> st
         result = json.loads(result_json)
         return _format_session_search_result(result, args)
     except Exception as exc:
-        logger.warning("RLM: session_search dispatch failed: %s", exc)
+        logger.warning("recall: session_search dispatch failed: %s", exc)
         return json.dumps({"error": str(exc)})
 
 
@@ -127,12 +127,12 @@ def _format_session_search_result(result: dict, args: dict) -> str:
     return json.dumps(result)
 
 
-def execute_rlm_search(
+def execute_recall(
     query: str,
     session_id: str = "",
     hermes_home: Optional[str] = None,
 ) -> str:
-    """Execute rlm_search — the plugin's sole tool."""
+    """Execute recall — the plugin's sole tool."""
     if not query.strip():
         return json.dumps({"error": "query is required"})
 
@@ -149,7 +149,7 @@ def execute_rlm_search(
             current_session_id=session_id,
         )
     except Exception as exc:
-        logger.warning("RLM sub-model loop failed, falling back to direct aux model: %s", exc)
+        logger.warning("recall sub-model loop failed, falling back to direct aux model: %s", exc)
         try:
             from tools.session_search_tool import session_search
 
@@ -169,11 +169,11 @@ def execute_rlm_search(
         except Exception as exc2:
             return json.dumps({"error": f"Sub-model loop and fallback both failed: {exc2}"})
 
-    return json.dumps({"answer": answer, "method": "rlm"})
+    return json.dumps({"answer": answer, "method": "recall"})
 
 
-def _handle_rlm_search_tool(args: dict, **kwargs) -> str:
-    """Handler for rlm_search when registered as a regular plugin tool."""
+def _handle_recall_tool(args: dict, **kwargs) -> str:
+    """Handler for recall when registered as a regular plugin tool."""
     session_id = kwargs.get("session_id", "")
     hermes_home = None
     try:
@@ -182,7 +182,7 @@ def _handle_rlm_search_tool(args: dict, **kwargs) -> str:
         hermes_home = str(get_hermes_home())
     except Exception:
         pass
-    return execute_rlm_search(
+    return execute_recall(
         query=args.get("query", ""),
         session_id=session_id,
         hermes_home=hermes_home,
@@ -190,25 +190,25 @@ def _handle_rlm_search_tool(args: dict, **kwargs) -> str:
 
 
 def register(ctx):
-    """Register RLM as a regular plugin tool."""
-    from .schemas import RLM_SEARCH_SCHEMA
+    """Register recall as a regular plugin tool."""
+    from .schemas import RECALL_SCHEMA
 
     if hasattr(ctx, "register_auxiliary_task"):
         ctx.register_auxiliary_task(
             key="rlm",
-            display_name="RLM retrieval",
+            display_name="Recall retrieval",
             description="Sub-model reasoning loop for archived session search",
             defaults={"provider": "auto", "model": "", "timeout": 120},
         )
-        logger.info("RLM: registered auxiliary.rlm task")
+        logger.info("recall: registered auxiliary.rlm task")
 
     if hasattr(ctx, "register_tool"):
         ctx.register_tool(
-            name="rlm_search",
-            toolset="rlm",
-            schema=RLM_SEARCH_SCHEMA,
-            handler=_handle_rlm_search_tool,
-            description="Search archived conversation context using sub-model reasoning loop",
-            emoji="🔍",
+            name="recall",
+            toolset="recall",
+            schema=RECALL_SCHEMA,
+            handler=_handle_recall_tool,
+            description="Search past conversation history using sub-model reasoning loop",
+            emoji="🧠",
         )
-    logger.info("RLM: registered rlm_search tool")
+    logger.info("recall: registered recall tool")

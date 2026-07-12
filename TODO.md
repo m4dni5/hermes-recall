@@ -1,9 +1,14 @@
 # TODO
 
+## Rename repo on GitHub
+
+The repo is `github.com/m4dni5/hermes-rlm`. Rename to `hermes-recall` and
+update the README install command to `hermes plugins install m4dni5/hermes-recall`.
+
 ## Verify `hermes plugins install` end-to-end
 
-Push to GitHub, run `hermes plugins install m4dni5/hermes-rlm` from a clean
-profile, verify rlm_search appears in tools and works.
+After repo rename, run `hermes plugins install m4dni5/hermes-recall` from
+a clean profile, verify `recall` appears in tools and works.
 
 ## Test with real session data
 

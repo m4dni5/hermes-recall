@@ -1,14 +1,14 @@
-"""Unit tests for RLM engine — parsing, schema, imports."""
+"""Unit tests for recall — parsing, schema, imports."""
 
 import pytest
 
 
 def test_schema_valid():
-    from schemas import RLM_SEARCH_SCHEMA
+    from schemas import RECALL_SCHEMA
 
-    assert RLM_SEARCH_SCHEMA["name"] == "rlm_search"
-    assert "query" in RLM_SEARCH_SCHEMA["parameters"]["properties"]
-    assert RLM_SEARCH_SCHEMA["parameters"]["required"] == ["query"]
+    assert RECALL_SCHEMA["name"] == "recall"
+    assert "query" in RECALL_SCHEMA["parameters"]["properties"]
+    assert RECALL_SCHEMA["parameters"]["required"] == ["query"]
 
 
 @pytest.mark.parametrize(
@@ -64,14 +64,14 @@ def test_find_final_no_match():
 
 def test_imports():
     """Verify all key imports resolve."""
-    from schemas import RLM_SEARCH_SCHEMA
+    from schemas import RECALL_SCHEMA
     from loop import run_sub_model_loop, _parse_tool_call, _find_final
-    from tools import execute_rlm_search, register
+    from tools import execute_recall, register
 
     assert callable(run_sub_model_loop)
-    assert callable(execute_rlm_search)
+    assert callable(execute_recall)
     assert callable(register)
-    assert RLM_SEARCH_SCHEMA["name"] == "rlm_search"
+    assert RECALL_SCHEMA["name"] == "recall"
 
 
 def test_build_system_prompt():

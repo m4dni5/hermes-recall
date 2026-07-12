@@ -1,5 +1,5 @@
-name: rlm
-description: "Encapsulated session search — sub-model reasoning loop over past conversations"
+name: recall
+description: "Sub-model reasoning loop over past conversations — search, explore, synthesize"
 version: 0.3.0
 author: matt
 license: MIT

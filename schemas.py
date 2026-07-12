@@ -1,9 +1,9 @@
-"""RLM tool schema — rlm_search takes a query, returns a synthesized answer."""
+"""Recall tool schema — recall(query) searches past conversations, returns a synthesized answer."""
 
-RLM_SEARCH_SCHEMA = {
-    "name": "rlm_search",
+RECALL_SCHEMA = {
+    "name": "recall",
     "description": (
-        "Search archived conversation history via an encapsulated sub-model. "
+        "Search past conversation history via an encapsulated sub-model. "
         "The sub-model explores past sessions using FTS5 search and returns "
         "a synthesized answer. Use when you need context from earlier "
         "conversations that's no longer in your active window."

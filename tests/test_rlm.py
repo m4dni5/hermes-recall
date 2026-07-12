@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Test harness for RLM sub-model loop.
+"""Test harness for recall sub-model loop.
 
-Exercises rlm_search against real session history from state.db.
+Exercises recall against real session history from state.db.
 
 Usage:
     cd ~/src/hermes-rlm
@@ -69,7 +69,7 @@ def main():
     elif session_id == "all":
         session_id = None
 
-    print(f"=== RLM Test Harness ===")
+    print(f"=== Recall Test Harness ===")
     print(f"Hermes home: {hermes_home}")
     print(f"Session: {session_id or 'none (all sessions)'}")
     print(f"Query: {args.query}")
